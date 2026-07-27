@@ -13,7 +13,15 @@ _RIDGE = 1e-6
 
 
 class SharedShapeTemporalGAMBoost:
-    """Cyclic Newton boosting over smooth value-time feature surfaces."""
+    """Cyclic Newton boosting over smooth value-time feature surfaces.
+
+    ``outer_bags`` bootstrap-resamples the training rows independently
+    ``outer_bags`` times (the validation split is fixed across bags, so
+    early stopping is judged consistently); each bag's fitted coefficients
+    are averaged at the end. This is the same bagging/variance-reduction
+    step EBM uses, reintroduced 2026-07-26 after being removed in an
+    earlier simplification pass -- see ``fit``'s docstring for why.
+    """
 
     def __init__(
         self,
@@ -25,6 +33,7 @@ class SharedShapeTemporalGAMBoost:
         static_penalty: float = 1.0,
         learning_rate: float = 0.02,
         max_rounds: int = 100,
+        outer_bags: int = 4,
         early_stopping_rounds: int = 15,
         val_fraction: float = 0.15,
         random_state: int = 42,
@@ -38,6 +47,7 @@ class SharedShapeTemporalGAMBoost:
         self.static_penalty = static_penalty
         self.learning_rate = learning_rate
         self.max_rounds = max_rounds
+        self.outer_bags = outer_bags
         self.early_stopping_rounds = early_stopping_rounds
         self.val_fraction = val_fraction
         self.random_state = random_state
@@ -87,7 +97,7 @@ class SharedShapeTemporalGAMBoost:
                                  self._value_centers, self._value_bandwidth)
             masked_basis = value_basis * observed[:, feature_index, :, None]
             temporal_design[:, feature_index, :] = np.einsum(
-                "ntv,tq->nvq", masked_basis, self._time_basis
+                "ndp,dq->npq", masked_basis, self._time_basis
             ).reshape(n_samples, -1)
 
         if static_values.shape[1] == 0:
@@ -159,54 +169,91 @@ class SharedShapeTemporalGAMBoost:
             self.n_value_bases, self.n_time_bases, self.temporal_penalty
         )
         static_penalty = self._static_penalty(self.n_static_bases, self.static_penalty)
+
+        # Validation split fixed across all bags -- every bag's early stopping
+        # is judged on the identical held-out rows, only the bootstrap-
+        # resampled TRAINING rows differ bag to bag.
         train_indices, validation_indices = make_validation_split(
             target, self.val_fraction, self.random_state
         )
 
-        train_temporal = temporal_design[train_indices]
+        rng = np.random.RandomState(self.random_state)
+        accumulated_intercept = 0.0
+        accumulated_temporal = None
+        accumulated_static = None
+        self.best_rounds_ = []
+        for bag in range(self.outer_bags):
+            fit_indices = (train_indices if self.outer_bags == 1
+                          else rng.choice(train_indices, size=train_indices.size, replace=True))
+            intercept, temporal_coefficients, static_coefficients, best_round = self._fit_one_bag(
+                temporal_design, static_design, target, sample_weight,
+                fit_indices, validation_indices, n_features, n_static,
+                temporal_penalty, static_penalty, rng,
+            )
+            self.best_rounds_.append(best_round)
+            accumulated_intercept += intercept
+            if accumulated_temporal is None:
+                accumulated_temporal = temporal_coefficients
+                accumulated_static = static_coefficients
+            else:
+                accumulated_temporal = accumulated_temporal + temporal_coefficients
+                if static_coefficients is not None:
+                    accumulated_static = accumulated_static + static_coefficients
+
+        self._intercept = accumulated_intercept / self.outer_bags
+        self._temporal_coefficients = accumulated_temporal / self.outer_bags
+        self._static_coefficients = (None if accumulated_static is None
+                                     else accumulated_static / self.outer_bags)
+        return self
+
+    def _fit_one_bag(self, temporal_design, static_design, target, sample_weight,
+                     fit_indices, validation_indices, n_features, n_static,
+                     temporal_penalty, static_penalty, rng):
+        fit_temporal = temporal_design[fit_indices]
         validation_temporal = temporal_design[validation_indices]
-        train_static = None if static_design is None else static_design[train_indices]
+        fit_static = None if static_design is None else static_design[fit_indices]
         validation_static = None if static_design is None else static_design[validation_indices]
-        train_target, validation_target = target[train_indices], target[validation_indices]
-        train_weight, validation_weight = sample_weight[train_indices], sample_weight[validation_indices]
+        fit_target, validation_target = target[fit_indices], target[validation_indices]
+        fit_weight, validation_weight = sample_weight[fit_indices], sample_weight[validation_indices]
 
         temporal_preconditioners = [
-            self._preconditioner(train_temporal[:, feature_index, :], train_weight, temporal_penalty)
+            self._preconditioner(fit_temporal[:, feature_index, :], fit_weight, temporal_penalty)
             for feature_index in range(n_features)
         ]
-        static_preconditioners = ([] if train_static is None else [
-            self._preconditioner(train_static[:, column_index, :], train_weight, static_penalty)
+        static_preconditioners = ([] if fit_static is None else [
+            self._preconditioner(fit_static[:, column_index, :], fit_weight, static_penalty)
             for column_index in range(n_static)
         ])
 
-        base_rate = np.clip(np.average(train_target, weights=train_weight), 1e-6, 1.0 - 1e-6)
+        base_rate = np.clip(np.average(fit_target, weights=fit_weight), 1e-6, 1.0 - 1e-6)
         intercept = float(np.log(base_rate / (1.0 - base_rate)))
         temporal_coefficients = np.zeros((n_features, temporal_design.shape[2]))
         static_coefficients = None if static_design is None else np.zeros((n_static, static_design.shape[2]))
-        train_score = np.full(train_indices.size, intercept)
+        fit_score = np.full(fit_indices.size, intercept)
         validation_score = np.full(validation_indices.size, intercept)
 
         best_loss = np.inf
         best_state = None
+        best_round = 0
         rounds_without_improvement = 0
         for round_index in range(1, self.max_rounds + 1):
-            probability = 1.0 / (1.0 + np.exp(-train_score))
-            residual = train_weight * (train_target - probability)
-            intercept_update = residual.sum() / max(0.25 * train_weight.sum(), _RIDGE)
+            probability = 1.0 / (1.0 + np.exp(-fit_score))
+            residual = fit_weight * (fit_target - probability)
+            intercept_update = residual.sum() / max(0.25 * fit_weight.sum(), _RIDGE)
             intercept += self.learning_rate * intercept_update
-            train_score += self.learning_rate * intercept_update
+            fit_score += self.learning_rate * intercept_update
             validation_score += self.learning_rate * intercept_update
 
             self._update_block(
-                temporal_preconditioners, train_temporal, validation_temporal,
-                temporal_coefficients, train_score, validation_score,
-                train_target, train_weight, self.learning_rate,
+                temporal_preconditioners, fit_temporal, validation_temporal,
+                temporal_coefficients, fit_score, validation_score,
+                fit_target, fit_weight, self.learning_rate,
             )
             if static_coefficients is not None:
                 self._update_block(
-                    static_preconditioners, train_static, validation_static,
-                    static_coefficients, train_score, validation_score,
-                    train_target, train_weight, self.learning_rate,
+                    static_preconditioners, fit_static, validation_static,
+                    static_coefficients, fit_score, validation_score,
+                    fit_target, fit_weight, self.learning_rate,
                 )
 
             validation_probability = 1.0 / (1.0 + np.exp(-validation_score))
@@ -215,15 +262,16 @@ class SharedShapeTemporalGAMBoost:
                 best_loss = validation_loss
                 best_state = (intercept, temporal_coefficients.copy(),
                               None if static_coefficients is None else static_coefficients.copy())
-                self.best_round_ = round_index
+                best_round = round_index
                 rounds_without_improvement = 0
             else:
                 rounds_without_improvement += 1
                 if rounds_without_improvement >= self.early_stopping_rounds:
                     break
 
-        self._intercept, self._temporal_coefficients, self._static_coefficients = best_state
-        return self
+        if best_state is None:
+            best_state = (intercept, temporal_coefficients, static_coefficients)
+        return (*best_state, best_round)
 
     def predict_proba(self, values, observed, static_values):
         normalized_values = apply_value_normalization(

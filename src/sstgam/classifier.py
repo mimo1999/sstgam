@@ -35,6 +35,11 @@ class SSTGAM(_SSTGAMBase):
         Smoothness penalties for spline temporal and static effects.
     learning_rate, max_rounds, early_stopping_rounds
         Boosting controls shared by both methods.
+    outer_bags : int, default=4
+        Number of bootstrap-resampled fits (the validation split is fixed
+        across bags) whose coefficients/tables are averaged at the end --
+        the same bagging EBM uses for variance reduction. ``outer_bags=1``
+        disables bagging (a single fit on the full training split).
     val_fraction, random_state, verbose
         Validation split and runtime controls.
     """
@@ -52,6 +57,7 @@ class SSTGAM(_SSTGAMBase):
         static_penalty: float = 1.0,
         learning_rate: float = 0.02,
         max_rounds: int = 100,
+        outer_bags: int = 4,
         early_stopping_rounds: int = 15,
         val_fraction: float = 0.15,
         random_state: int = 42,
@@ -63,8 +69,8 @@ class SSTGAM(_SSTGAMBase):
             raise ValueError("Basis counts, bin count, and tree_depth must be positive.")
         if min(temporal_penalty, static_penalty, learning_rate) <= 0:
             raise ValueError("Penalties and learning_rate must be positive.")
-        if max_rounds < 1 or early_stopping_rounds < 1:
-            raise ValueError("max_rounds and early_stopping_rounds must be positive.")
+        if max_rounds < 1 or early_stopping_rounds < 1 or outer_bags < 1:
+            raise ValueError("max_rounds, early_stopping_rounds, and outer_bags must be positive.")
         super().__init__(val_fraction=val_fraction, random_state=random_state, verbose=verbose)
         self.method = method
         self.n_value_bases = n_value_bases
@@ -77,6 +83,7 @@ class SSTGAM(_SSTGAMBase):
         self.static_penalty = static_penalty
         self.learning_rate = learning_rate
         self.max_rounds = max_rounds
+        self.outer_bags = outer_bags
         self.early_stopping_rounds = early_stopping_rounds
 
     def _fit_trainer(self, values, observed, static_values, time_coordinates,
@@ -91,6 +98,7 @@ class SSTGAM(_SSTGAMBase):
         common_arguments = dict(
             learning_rate=self.learning_rate,
             max_rounds=self.max_rounds,
+            outer_bags=self.outer_bags,
             early_stopping_rounds=self.early_stopping_rounds,
             val_fraction=self.val_fraction,
             random_state=self.random_state,

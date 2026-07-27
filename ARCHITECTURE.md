@@ -49,6 +49,33 @@ quantiles. It stores a value-bin by time-bin table per feature. At each
 boosting round, a shallow regression tree smooths a Newton update over that
 table's value and time coordinates.
 
+The split order is chosen per round rather than left to the tree. Depth-1
+candidate splits are fitted on the value axis and the time axis separately and
+scored by weighted-SSE gain minus `2 * log(m)`, where `m` is the number of
+distinct candidate thresholds on that axis. The higher-scoring axis splits
+first; the other axis refines within each resulting group. The penalty is a
+Bonferroni/BIC-style multiplicity correction. Without it the value axis wins
+on candidate count alone, since it normally has more quantile bins than there
+are observation times.
+
+Static terms have a single axis and use a plain one-stage tree.
+
+The table is indexed by ordinal time position, but the trees split on the
+normalized time coordinate, so irregular spacing between observation times is
+respected when grouping time points during fitting.
+
+## Bagging
+
+Both backends fit `outer_bags` times on bootstrap resamples of the training
+rows and average the fitted parameters. The validation split is held fixed
+across bags, so early stopping is judged on the same held-out rows every time
+and only the resampled training rows differ.
+
+Averaging does not change the model form. A mean of coefficient vectors over a
+shared basis is another coefficient vector, and a mean of value-time tables is
+another table, so the fitted `f_k` stays exactly as defined above. Bagging is a
+variance-reduction step only. Set `outer_bags=1` to disable it.
+
 ## Interpretation
 
 Spline models expose `value_effect` and `temporal_surface`. Tree models expose
