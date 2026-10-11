@@ -42,20 +42,75 @@ f_k(value, time) = sum_p sum_q coefficient[k,p,q]
 families, selected by `basis`: fixed-bandwidth Gaussian radial basis
 functions (`"rbf"`, default) or a clamped, evenly knotted B-spline basis
 (`"bspline"`). Both are implemented in `bases.py` behind the same
-`make_basis_params`/`basis_design` interface, so the rest of the boosting
+`make_basis_params`/`basis_design` interface, so the rest of the fitting
 code is basis-agnostic. Second-difference penalties on adjacent coefficients
 keep the surface smooth along both the value and time axes regardless of
 basis choice.
 
-The model is fitted by cyclic (coordinate-descent) gradient boosting with
-early stopping on validation log loss. Each coordinate-block update
-(`_update_block`) uses a fixed quasi-Newton step, not literal Newton's
-method: `_preconditioner` inverts a penalized *worst-case* Hessian bound
-(evaluated at `p = 0.5`) once per bag, and reuses that same inverse for every
-boosting round even as the true Hessian `p * (1 - p)` shrinks as the fit
-improves. This is a majorization-minimization / IRLS-style bound — a common
-and reasonable approximation, but distinct from recomputing the Hessian each
-round.
+The fit maximises the penalized log-likelihood
+
+```text
+sum_i w_i loglik_i  -  1/2 sum_k c_k' P_k c_k  -  1/2 sum_s b_s' P_s b_s
+```
+
+directly, by P-IRLS (`_penalized_newton`), the standard way to fit a
+penalized GAM: all terms share one design matrix (intercept, every surface
+block, every static block), and each iteration takes a full Newton step with
+gradient `X' w (y - p) - P beta` and Hessian `X' diag(w p (1 - p)) X + P`,
+halving the step if it would not improve the objective. The model has few
+coefficients (161 on the 8-feature IEEE benchmark), so each iteration is one
+small dense solve, and it converges in under 20 iterations. The Hessian is
+accumulated over row chunks to bound memory.
+
+### Choosing the penalty
+
+Because the fit is the exact penalized optimum, the penalty alone sets the
+smoothness, and its right value varies by orders of magnitude between
+datasets: roughly with the number of coefficients per minority-class
+example: 0.01-0.1 on the 14k-event fraud benchmark with ~350 coefficients,
+but in the thousands for a small, wide dataset with a few hundred events and
+thousands of coefficients. No fixed default
+serves both, so `temporal_penalty`/`static_penalty` default to `"auto"`
+(`_select_penalty`): one shared penalty is chosen by held-out weighted log
+loss and the model is refit on all rows. The search starts at
+`100 x coefficients / minority examples`, brackets it by `sqrt(10)`, and
+steps outward by 10x only while the edge value beats its neighbour by more
+than one standard error of their paired per-row loss difference; it then
+takes the largest penalty within one standard error of the best. Fits warm
+start from the nearest penalty already tried.
+
+The held-out loss comes from one stratified `val_fraction` split when that
+split holds at least 500 minority examples. Below that, a single split is
+too noisy to rank penalties, so the search uses 5-fold cross-validation and
+compares out-of-fold losses over every row, at roughly 5x the search cost.
+Two alternatives were measured and rejected: a fixed relative tolerance
+(cannot be right for both large and small validation sets) and AIC on all
+rows (with far more coefficients than events the model nearly separates the
+classes, and AIC drove the penalty to its lower bound).
+
+This replaced cyclic boosting, which updated one block at a time over
+hundreds of rounds: same optimum, but it converged slowly when blocks were
+correlated (13 minutes on the benchmark vs 9 seconds). Because the fit is
+the exact penalized optimum, `temporal_penalty` and `static_penalty` are the
+only smoothness controls; there are no boosting rounds, learning rate or
+validation split, so the spline method trains on all rows.
+
+With `value_transform="quantile"`, static covariates get the same empirical
+CDF transform as temporal values before their basis is applied. Heavy-tailed
+amounts, counts and integer codes otherwise bunch onto a few basis functions
+under a z-score; on the benchmark this transform alone moved test AUC-ROC
+from 0.785 to 0.809 at the same basis size.
+
+### Centring (identifiability)
+
+A constant added to a surface can be traded against the intercept, so an
+unconstrained surface's level is arbitrary. Each surface is therefore
+constrained to average zero over the observed training cells, and each static
+effect to average zero over the training rows — the same sum-to-zero
+identifiability constraint mgcv uses. It is imposed exactly by fitting in the
+null space of the term's mean basis row (`_centering_basis`): coefficients are
+`c = Z theta` with `Z` an orthonormal basis of `{c : mean_row @ c = 0}`.
+Averages of centred coefficient vectors are centred, so bagging preserves it.
 
 ## Tree backend
 
@@ -78,7 +133,9 @@ more quantile bins than there are observation times.
 
 Each tree leaf's update value is a true per-round Newton step
 (`gradient_sum / hessian_sum`, recomputed from the current fit every round),
-unlike the spline backend's fixed quasi-Newton preconditioner above.
+like a Newton step of the spline backend. Unlike the spline backend, the
+tree's shrinkage (`learning_rate`, default 0.02) and the stopping round act as
+regularizers.
 
 Static terms have a single axis and use a plain one-stage tree.
 
@@ -89,9 +146,10 @@ respected when grouping time points during fitting.
 ## Bagging
 
 Both backends fit `outer_bags` times on bootstrap resamples of the training
-rows and average the fitted parameters. The validation split is held fixed
-across bags, so early stopping is judged on the same held-out rows every time
-and only the resampled training rows differ.
+rows and average the fitted parameters. For the tree backend the validation
+split is held fixed across bags, so early stopping is judged on the same
+held-out rows every time and only the resampled training rows differ. The
+spline backend has no validation split and resamples all rows.
 
 Averaging does not change the model form. A mean of coefficient vectors over a
 shared basis is another coefficient vector, and a mean of value-time tables is
@@ -101,9 +159,11 @@ variance-reduction step only. Set `outer_bags=1` to disable it.
 ## Interpretation
 
 Spline models expose `value_effect` and `temporal_surface`. Tree models expose
-`value_time_table`. Each output is on the log-odds scale; positive values
-increase the predicted probability relative to the intercept and negative
-values decrease it.
+`value_time_table`. Both expose `static_effect` for static covariates and
+missingness indicators. Each output is on the log-odds scale. Spline effects
+are centred (see above), so a positive value means the observation raises the
+log-odds relative to an average observed cell of that feature (or an average
+row, for a static effect), and a negative value lowers it.
 
 ## Related work
 
@@ -130,7 +190,9 @@ forecast horizon.
 
 - **Missingness is treated as uninformative at the cell level.** An
   unobserved `(feature, time)` cell contributes exactly zero to the score
-  (see `observed` in the statistical model above) — equivalent to assuming
+  (see `observed` in the statistical model above). For the spline method,
+  centring makes zero the contribution of an average observed cell, so a
+  missing cell is scored as an average observation — equivalent to assuming
   missingness is not, by itself, evidence about the outcome (a cell-level
   MAR assumption). This is a real modeling choice, not a neutral default: in
   settings where measurement frequency itself is informative (e.g. sicker

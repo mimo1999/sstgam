@@ -39,38 +39,6 @@ def fit_quantile_tables(values: np.ndarray, observed: np.ndarray):
     return tables
 
 
-def apply_quantile_tables(values: np.ndarray, tables, clip: float) -> np.ndarray:
-    """Apply fitted empirical CDF tables to a value tensor."""
-    transformed = np.empty(values.shape, dtype=np.float32)
-    for feature_index, (x_values, y_values) in enumerate(tables):
-        transformed[:, feature_index, :] = (
-            np.interp(values[:, feature_index, :], x_values, y_values) * clip
-        ).astype(np.float32)
-    return transformed
-
-
-def fit_value_normalization(values: np.ndarray, observed: np.ndarray, transform: str, clip: float):
-    """Fit and apply either quantile or robust z-score normalization."""
-    n_features = values.shape[1]
-    if transform == "quantile":
-        tables = fit_quantile_tables(values, observed)
-        return (
-            apply_quantile_tables(values, tables, clip),
-            np.zeros(n_features, dtype=np.float32),
-            np.ones(n_features, dtype=np.float32),
-            tables,
-        )
-    if transform == "zscore":
-        centers, scales = robust_center_scale(values, observed)
-        return values, centers, scales, None
-    raise ValueError(f"value_transform must be 'zscore' or 'quantile', got {transform!r}")
-
-
-def apply_value_normalization(values: np.ndarray, transform: str, tables, clip: float) -> np.ndarray:
-    """Apply a normalization fitted by :func:`fit_value_normalization`."""
-    return apply_quantile_tables(values, tables, clip) if transform == "quantile" else values
-
-
 def static_stats(values: np.ndarray):
     """Return per-column finite-value means and standard deviations."""
     means = np.zeros(values.shape[1], dtype=np.float32)

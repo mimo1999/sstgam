@@ -78,14 +78,17 @@ one-dimensional static effect. This is an additive time-varying model: it
 does not directly model lags, slopes, or interactions between successive
 measurements. Supply those as input features if they are needed.
 
-Both methods are fitted by cyclic (coordinate-descent) gradient boosting with
-early stopping on validation log loss. The tree method's leaf values are true
-per-round Newton steps (fresh gradient/Hessian each round); the spline
-method's coefficient updates use a fixed quasi-Newton preconditioner from a
-worst-case Hessian bound computed once per bag (see [ARCHITECTURE.md](https://github.com/mimo1999/sstgam/blob/main/ARCHITECTURE.md)). Both
-methods are bagged: `outer_bags` independent fits are run on
-bootstrap resamples of the training rows (the validation split is held fixed
-across bags) and their fitted parameters are averaged. Averaging leaves the
+The spline method is a penalized GAM solved directly by P-IRLS: a handful of
+full penalized Newton steps over all coefficients at once (typically under
+20), on all training rows, with no boosting rounds or validation split.
+`temporal_penalty`/`static_penalty` set the smoothness. Every spline term is
+centred (a surface averages zero over the observed training cells, a static
+effect over the training rows), so effect levels are comparable and the
+overall level sits in the intercept. The tree method is fitted by cyclic
+Newton boosting with shallow trees and early stopping on validation log loss
+(see [ARCHITECTURE.md](https://github.com/mimo1999/sstgam/blob/main/ARCHITECTURE.md)). Both methods are bagged: `outer_bags`
+independent fits are run on bootstrap resamples of the training rows and
+their fitted parameters are averaged. Averaging leaves the
 model in the same form — a mean of coefficient vectors over a shared basis is
 another coefficient vector, and a mean of value-time tables is another table —
 so bagging reduces variance without changing what `f_k` is.
@@ -122,17 +125,32 @@ surface = model.temporal_surface(
 )
 ```
 
+Static covariates (and, with `include_missingness_indicators=True`, the
+`<feature>_observed_fraction` indicators) are inspectable with either method:
+
+```python
+age_effect = model.static_effect("age", values=[30, 50, 70])
+model.static_features_  # names accepted by static_effect
+```
+
 ## Key parameters
 
 - `n_value_bases`, `n_time_bases`, `temporal_penalty`: spline surface
-  complexity and smoothness.
+  complexity and smoothness. `n_static_bases`, `static_penalty`: the same for
+  static effects. The penalties default to `"auto"`: the right value differs
+  by orders of magnitude between datasets (it tracks how many minority-class
+  examples each coefficient has), so it is chosen by held-out log loss --
+  one validation split on large data, 5-fold cross-validation when there
+  are under ~500 held-out minority examples. Pass numbers to fix them.
 - `n_value_bins`, `tree_depth`: tree table resolution and update complexity.
-- `learning_rate`, `max_rounds`, `early_stopping_rounds`: optimization
-  controls.
+- `learning_rate`, `max_rounds`, `early_stopping_rounds`: boosting controls
+  for the tree method; the spline method ignores them. `val_fraction`: the
+  tree's early-stopping split and the spline's `"auto"` penalty split.
 - `outer_bags` (default 4): bagged fits to average. Set to 1 to disable
   bagging and fit once on the full training split; cost scales linearly.
 - `value_transform`: use `"quantile"` for robust rank-based scaling or
-  `"zscore"` for robust center/scale normalization.
+  `"zscore"` for robust center/scale normalization. The spline method applies
+  it to temporal values and static covariates alike.
 - `include_missingness_indicators` (default `False`): adds one extra static
   covariate per temporal feature (its per-sample observed-fraction), so the
   model can learn from informative missingness instead of assuming

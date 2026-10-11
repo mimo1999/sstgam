@@ -157,3 +157,80 @@ def test_value_effect_accepts_scalar(longitudinal_data):
     X, y = longitudinal_data
     model = SSTGAM(max_rounds=8, early_stopping_rounds=3).fit(X, y)
     assert model.value_effect("signal", 0.5).shape == (1,)
+
+
+def test_spline_terms_are_centred(longitudinal_data):
+    X, y = longitudinal_data
+    model = SSTGAM(method="spline", outer_bags=2, random_state=0).fit(X, y)
+
+    # Each surface averages zero over the observed training cells ...
+    cell_effects = []
+    for time_id in (0, 4):
+        column = X[f"signal_{time_id}"].dropna().to_numpy()
+        cell_effects.append(model.temporal_surface("signal", column, [time_id])[:, 0])
+    assert abs(np.concatenate(cell_effects).mean()) < 1e-6
+    # ... and each static effect over the training rows.
+    assert abs(model.static_effect("context", X["context"]).mean()) < 1e-6
+
+
+def test_single_bag_spline_fit_is_the_deterministic_penalized_optimum(longitudinal_data):
+    X, y = longitudinal_data
+    models = [SSTGAM(method="spline", temporal_penalty=1.0, static_penalty=1.0, outer_bags=1,
+                     random_state=seed).fit(X, y) for seed in (0, 1)]
+    # No validation split or boosting path: one bag fits all rows to the same optimum.
+    np.testing.assert_allclose(models[0].predict_proba(X), models[1].predict_proba(X), atol=1e-10)
+    assert models[0].model_.n_iter_[0] < 50
+
+
+def test_temporal_penalty_controls_smoothness(longitudinal_data):
+    X, y = longitudinal_data
+    grid = np.linspace(-2.0, 2.0, 21)
+    ranges = [
+        np.ptp(SSTGAM(method="spline", temporal_penalty=penalty, max_rounds=300, outer_bags=1)
+               .fit(X, y).value_effect("signal", grid))
+        for penalty in (0.1, 1e4)
+    ]
+    assert ranges[1] < 0.1 * ranges[0]
+
+
+@pytest.mark.parametrize("method", ["spline", "tree"])
+def test_static_effect(longitudinal_data, method):
+    X, y = longitudinal_data
+    model = SSTGAM(method=method, include_missingness_indicators=True, max_rounds=12,
+                   early_stopping_rounds=4).fit(X, y)
+    assert model.static_features_ == ["context", "signal_observed_fraction"]
+    assert model.static_effect("context", [-1.0, 0.0, np.nan, 1.0]).shape == (4,)
+    assert model.static_effect("signal_observed_fraction", 0.5).shape == (1,)
+    with pytest.raises(ValueError, match="Unknown static feature"):
+        model.static_effect("signal", 0.0)
+
+
+def test_auto_penalty_prefers_the_smoother_of_near_ties(longitudinal_data):
+    X, y = longitudinal_data
+    backend = SSTGAM(method="spline", outer_bags=1).fit(X, y).model_
+    search = backend.penalty_search_
+    assert len(search) >= 3
+    # One-standard-error rule: never the minimiser's smaller neighbours, at least as smooth as it.
+    assert backend.temporal_penalty_ == backend.static_penalty_ >= min(search, key=search.get)
+
+
+def test_auto_penalty_regularizes_noise_more_than_signal():
+    generator = np.random.RandomState(0)
+    n_samples = 600
+    X = pd.DataFrame({f"a_{t}": generator.normal(size=n_samples) for t in range(3)})
+    X["context"] = generator.normal(size=n_samples)
+    signal = (2.0 * X["a_0"] + X["context"] + generator.logistic(size=n_samples) > 0).astype(int)
+    noise = generator.randint(0, 2, size=n_samples)
+    chosen = [SSTGAM(method="spline", outer_bags=1).fit(X, target).model_.temporal_penalty_
+              for target in (signal, noise)]
+    assert chosen[1] > 10 * chosen[0]
+
+
+def test_explicit_penalty_skips_the_search(longitudinal_data):
+    X, y = longitudinal_data
+    backend = SSTGAM(method="spline", temporal_penalty=3.0, static_penalty="auto", outer_bags=1).fit(X, y).model_
+    assert backend.temporal_penalty_ == 3.0 and backend.penalty_search_
+    backend = SSTGAM(method="spline", temporal_penalty=3.0, static_penalty=2.0, outer_bags=1).fit(X, y).model_
+    assert (backend.temporal_penalty_, backend.static_penalty_) == (3.0, 2.0) and not backend.penalty_search_
+    with pytest.raises(ValueError, match="temporal_penalty must be 'auto' or a positive number"):
+        SSTGAM(temporal_penalty="smooth").fit(X, y)

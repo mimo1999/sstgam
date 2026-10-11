@@ -41,13 +41,13 @@ fraud rate.
 | --- | --- | --- | --- | --- | --- | --- |
 | xgboost | ieee_cis_fraud_wide_k5 | time_holdout | 0.852 | 0.431 | 0.105 | 26.1 |
 | random_forest | ieee_cis_fraud_wide_k5 | time_holdout | 0.840 | 0.383 | 0.069 | 84.8 |
+| sstgam (spline, bspline basis, val-selected) | ieee_cis_fraud_wide_k5 | time_holdout | 0.827 | 0.411 | 0.026 | 25.4 |
+| sstgam (spline, rbf basis, val-selected) | ieee_cis_fraud_wide_k5 | time_holdout | 0.826 | 0.412 | **0.026** | **21.4** |
+| sstgam (spline, rbf, n_value_bases=10/n_time_bases=5) | ieee_cis_fraud_wide_k5 | time_holdout | 0.824 | 0.410 | 0.026 | 44.2 |
 | ebm (interactions=0) | ieee_cis_fraud_wide_k5 | time_holdout | 0.823 | 0.380 | 0.132 | 340.7 |
-| sstgam (tree, tuned) | ieee_cis_fraud_wide_k5 | time_holdout | 0.812 | 0.374 | **0.027** | 157.0 |
+| sstgam (tree, tuned) | ieee_cis_fraud_wide_k5 | time_holdout | 0.812 | 0.374 | 0.027 | 157.0 |
 | sstgam (tree, tuned + sample_weight) | ieee_cis_fraud_wide_k5 | time_holdout | 0.816 | 0.329 | 0.163 | 148.8 |
 | sstgam (tree, tuned, K=15) | ieee_cis_fraud_wide_k15 | time_holdout | 0.813 | 0.371 | 0.027 | 259.9 |
-| sstgam (spline, rbf basis, first-guess) | ieee_cis_fraud_wide_k5 | time_holdout | 0.770 | 0.215 | 0.031 | **83.6** |
-| sstgam (spline, bspline basis, first-guess) | ieee_cis_fraud_wide_k5 | time_holdout | 0.766 | 0.213 | 0.031 | 91.0 |
-| sstgam (spline, rbf, n_value_bases=10/n_time_bases=5) | ieee_cis_fraud_wide_k5 | time_holdout | 0.768 | 0.211 | 0.031 | 192.9 |
 | gam (pygam, 40K-row subsample) | ieee_cis_fraud_wide_k5 | time_holdout | 0.749 | 0.195 | 0.031 | 37.8 |
 
 `sstgam (tree)` hyperparameters were chosen by `scripts/tune_sstgam.py`, a
@@ -64,12 +64,15 @@ outperformed their more expensive alternatives (`outer_bags>1`,
 `tree_depth=3`) on this dataset -- more bagging/depth wasn't buying
 anything here.
 
-`sstgam (spline)` is a first-guess, least-compute configuration, not tuned
-like the tree backend: `n_value_bases=4, n_time_bases=3, n_static_bases=4,
-learning_rate=0.1, max_rounds=60, early_stopping_rounds=15, outer_bags=1`.
-Each temporal feature's tensor-product surface costs an
-`n_value_bases * n_time_bases` square matrix inversion per bag, so this
-config was chosen purely to be cheap, not to be competitive.
+`sstgam (spline)` was configured on the validation split (fit on train,
+scored on val; test untouched until the final run): `n_value_bases=4,
+n_time_bases=3, n_static_bases=12, temporal_penalty=static_penalty=0.1,
+outer_bags=1`. Validation AUC-ROC plateaued at 0.811-0.814 over 4x3 and 8x5
+surfaces, 8-24 static bases and penalties 0.01-10; this config was the best
+and among the cheapest, and `outer_bags=4` added nothing (0.8131 vs 0.8137)
+at 3.5x the fit time. The spline backend solves its penalized fit directly
+by P-IRLS (see `ARCHITECTURE.md`), so there are no rounds or learning rate to
+tune; all three spline runs converged in 8 Newton iterations.
 
 **Sample-weight experiment, and why it didn't do what was expected**: to test
 whether SSTGAM (tree)'s calibration advantage over XGBoost/EBM was just an
@@ -127,30 +130,33 @@ cohort) over further tuning on this one specifically.
 
 Notes:
 - SSTGAM (tree, unweighted) is essentially tied with EBM on ranking (AUC-PRC
-  0.374 vs 0.380) at under half EBM's fit time, and keeps the best
-  calibration of all models by a wide margin -- 5x lower Brier score than
-  EBM, the next GAM-family model.
-- SSTGAM (spline) at this untuned, minimal-basis config trails SSTGAM (tree)
-  by a wide margin (AUC-PRC ~0.21 vs 0.374) and only edges out plain pygam
-  GAM -- reads as "too coarse a basis for this data's value-time structure,"
-  not "the spline backend doesn't work here." It's the cheapest SSTGAM
-  variant tested (83.6s, faster than RF) and hasn't been through a tuning
-  pass the way the tree backend was; expect this gap to close somewhat with
-  more bases/rounds, at proportional extra cost.
-- Basis family (`"rbf"` vs `"bspline"`) made almost no difference at this
-  basis size (AUC-PRC 0.215 vs 0.213, Brier essentially tied) -- `bspline`'s
-  Cox-de Boor recursion cost ~9% more time (91.0s vs 83.6s) for no quality
-  gain here.
-- Bumping the RBF basis size from `n_value_bases=4, n_time_bases=3` (12
-  coefficients/feature) to `n_value_bases=10, n_time_bases=5` (50
-  coefficients/feature) more than doubled fit time (83.6s -> 192.9s) for
-  *no* quality gain -- AUC-PRC went slightly down (0.215 -> 0.211), within
-  noise. So basis coarseness was the wrong diagnosis for the spline
-  backend's gap to the tree backend on this dataset; the other first-guess
-  constraints (`learning_rate=0.1, max_rounds=60, outer_bags=1`) or a
-  genuine better fit of the tree backend's discrete value-time table to this
-  data's structure are more likely explanations, worth checking before
-  spending more compute on basis size specifically.
+  0.374 vs 0.380) at under half EBM's fit time, with calibration second
+  only to SSTGAM (spline) -- 5x lower Brier score than EBM.
+- SSTGAM (spline) is now the strongest GAM-family model here: AUC-ROC
+  0.826 / AUC-PRC 0.412 vs EBM's 0.823 / 0.380 and SSTGAM (tree)'s 0.812 /
+  0.374, with the best Brier score of all models (0.026) and the fastest fit
+  of any SSTGAM/EBM variant (21s, 7x faster than the tree, 16x faster than
+  EBM). It beats random forest on AUC-PRC and trails only XGBoost on ranking.
+- How it got there, all measured on this benchmark:
+  - Earlier versions scored AUC-ROC 0.770 / AUC-PRC 0.215 (84s). The
+    optimizer never converged: a fixed `p = 0.5` curvature bound made each
+    step ~7x too short at this ~3.5% fraud rate, and the penalty was missing
+    from the gradient.
+  - Penalized Newton boosting fixed convergence (AUC-ROC 0.785) but took
+    13-32 minutes, because updating one coefficient block at a time
+    converges slowly when blocks are correlated (the `C*` counters, and the
+    static `current_*` copies of the temporal values).
+  - Solving the same penalized fit jointly by P-IRLS reached the identical
+    optimum (test AUC-ROC 0.7848 vs 0.7847) in 9s instead of 797s.
+  - Quantile-transforming static covariates, as the temporal values already
+    were, then lifted AUC-ROC from 0.785 to 0.809 at the same basis size:
+    under a z-score the heavy-tailed amounts, counts and category codes
+    bunch onto a few basis functions. The larger static basis and lighter
+    penalty chosen on validation give the rest.
+- Basis family (`"rbf"` vs `"bspline"`) still makes no material difference
+  (AUC-PRC 0.412 vs 0.411), and a 10x5 surface (50 coefficients/feature)
+  buys nothing over 4x3 (12) at 2x the fit time -- the value-time surface
+  resolution is not the bottleneck on this dataset; the static effects were.
 - XGBoost's and EBM's `scale_pos_weight`/`sample_weight` imbalance correction
   helps their ranking metrics but visibly hurts calibration (their Brier
   scores are the two worst) -- a reminder not to compare Brier scores

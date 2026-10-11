@@ -2,10 +2,9 @@
 
 import numpy as np
 from scipy.special import expit
-from sklearn.metrics import log_loss
 from sklearn.tree import DecisionTreeRegressor
 
-from ._training import make_validation_split
+from ._training import boost_bag, bootstrap_bags, make_validation_split
 
 _MIN_HESSIAN = 1e-6
 _N_STATIC_BINS = 16
@@ -90,10 +89,18 @@ class SharedShapeTemporalGAMTreeBoost:
         return [self._bin(np.nan_to_num(values[:, feature_index, :], nan=0.0), edges)
                 for feature_index, edges in enumerate(self._value_edges)]
 
+    def _static_column_bins(self, column_index: int, values) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        filled = np.where(np.isfinite(values), values, self._static_fill[column_index])
+        return self._bin(filled, self._static_edges[column_index])
+
     def _static_bins(self, static_values) -> list[np.ndarray]:
-        filled = np.where(np.isfinite(static_values), static_values, self._static_fill)
-        return [self._bin(filled[:, column_index], edges)
-                for column_index, edges in enumerate(self._static_edges)]
+        return [self._static_column_bins(column_index, static_values[:, column_index])
+                for column_index in range(len(self._static_edges))]
+
+    def static_effect(self, column_index: int, values) -> np.ndarray:
+        """Log-odds effect of raw values of one static covariate (missing values use the median bin)."""
+        return self._static_tables[column_index][self._static_column_bins(column_index, values)]
 
     def _tree_update(self, coordinates, gradient_sum, hessian_sum, rng):
         """Plain single-stage tree update -- used for 1-D (static) terms."""
@@ -198,9 +205,8 @@ class SharedShapeTemporalGAMTreeBoost:
         values = np.asarray(values, dtype=np.float32)
         observed = np.asarray(observed, dtype=np.float64)
         target = np.asarray(target, dtype=np.float64).ravel()
-        n_samples, n_features, n_times = values.shape
+        n_samples, _, n_times = values.shape
         static_values = np.asarray(static_values, dtype=np.float32)
-        n_static = static_values.shape[1]
         weights = (np.ones(n_samples, dtype=np.float64) if sample_weight is None
                    else np.asarray(sample_weight, dtype=np.float64).ravel())
 
@@ -233,75 +239,47 @@ class SharedShapeTemporalGAMTreeBoost:
         )
 
         rng = np.random.RandomState(self.random_state)
-        self.best_rounds_ = []
-        bagged_intercepts = []
-        self._bagged_feature_tables = []
-        bagged_static_tables = []
-        for _ in range(self.outer_bags):
-            fit_indices = (train_indices if self.outer_bags == 1
-                          else rng.choice(train_indices, size=train_indices.size, replace=True))
-            intercept, feature_tables, static_tables, best_round = self._fit_one_bag(
-                weights, target, observed, fit_indices, validation_indices,
-                n_features, n_static, n_value_bins, n_times,
-                static_bins, temporal_coordinates, temporal_cell_ids,
-                static_coordinates, rng,
-            )
-            self.best_rounds_.append(best_round)
-            bagged_intercepts.append(intercept)
-            self._bagged_feature_tables.append(feature_tables)
-            bagged_static_tables.append(static_tables)
+        bags = [
+            self._fit_one_bag(weights, target, observed, fit_indices, validation_indices,
+                              n_value_bins, n_times, static_bins, temporal_coordinates,
+                              temporal_cell_ids, static_coordinates, rng)
+            for fit_indices in bootstrap_bags(train_indices, self.outer_bags, rng)
+        ]
+        self._bagged_feature_tables = [feature_tables for _, (feature_tables, _), _ in bags]
+        self.best_rounds_ = [best_round for _, _, best_round in bags]
 
-        self._intercept = float(np.mean(bagged_intercepts))
+        self._intercept = float(np.mean([intercept for intercept, _, _ in bags]))
         self._feature_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_feature_tables)]
-        self._static_tables = [np.mean(tables, axis=0) for tables in zip(*bagged_static_tables)]
+        self._static_tables = [np.mean(tables, axis=0)
+                               for tables in zip(*(static_tables for _, (_, static_tables), _ in bags))]
         return self
 
     def _fit_one_bag(self, weights, target, observed, fit_indices, validation_indices,
-                     n_features, n_static, n_value_bins, n_times,
-                     static_bins, temporal_coordinates, temporal_cell_ids,
-                     static_coordinates, rng):
-        base_rate = np.clip(np.average(target[fit_indices], weights=weights[fit_indices]), 1e-6, 1 - 1e-6)
-        intercept = float(np.log(base_rate / (1.0 - base_rate)))
+                     n_value_bins, n_times, static_bins, temporal_coordinates,
+                     temporal_cell_ids, static_coordinates, rng):
         feature_tables = [np.zeros(bin_count * n_times) for bin_count in n_value_bins]
         static_tables = [np.zeros(len(edges) - 1) for edges in self._static_edges]
-
-        fit_score = np.full(fit_indices.size, intercept)
-        validation_score = np.full(validation_indices.size, intercept)
-        best_loss = np.inf
-        best_state = None
-        best_round = 0
-        rounds_without_improvement = 0
-
         fit_target, fit_weight = target[fit_indices], weights[fit_indices]
-        for round_index in range(1, self.max_rounds + 1):
-            gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
-            intercept_update = gradient.sum() / max(hessian.sum(), _MIN_HESSIAN)
-            intercept += self.learning_rate * intercept_update
-            fit_score += self.learning_rate * intercept_update
-            validation_score += self.learning_rate * intercept_update
+        fit_observed, validation_observed = observed[fit_indices], observed[validation_indices]
+        fit_cells = [cell_ids[fit_indices] for cell_ids in temporal_cell_ids]
+        validation_cells = [cell_ids[validation_indices] for cell_ids in temporal_cell_ids]
 
-            for feature_index in range(n_features):
+        def update_terms(fit_score, validation_score):
+            for feature_index, table in enumerate(feature_tables):
                 gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
                 update = self._update_temporal_term(
-                    gradient, hessian,
-                    temporal_cell_ids[feature_index][fit_indices],
-                    observed[fit_indices, feature_index, :],
-                    temporal_coordinates[feature_index],
-                    n_value_bins[feature_index] * n_times, rng,
+                    gradient, hessian, fit_cells[feature_index], fit_observed[:, feature_index, :],
+                    temporal_coordinates[feature_index], table.size, rng,
                 )
                 if update is None:
                     continue
-                feature_tables[feature_index] += self.learning_rate * update
-                fit_score += self.learning_rate * (
-                    update[temporal_cell_ids[feature_index][fit_indices]] *
-                    observed[fit_indices, feature_index, :]
-                ).sum(axis=1)
-                validation_score += self.learning_rate * (
-                    update[temporal_cell_ids[feature_index][validation_indices]] *
-                    observed[validation_indices, feature_index, :]
-                ).sum(axis=1)
+                update *= self.learning_rate
+                table += update
+                fit_score += (update[fit_cells[feature_index]] * fit_observed[:, feature_index, :]).sum(axis=1)
+                validation_score += (update[validation_cells[feature_index]] *
+                                     validation_observed[:, feature_index, :]).sum(axis=1)
 
-            for column_index in range(n_static):
+            for column_index, table in enumerate(static_tables):
                 gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
                 update = self._update_static_term(
                     gradient, hessian, static_bins[column_index][fit_indices],
@@ -309,28 +287,17 @@ class SharedShapeTemporalGAMTreeBoost:
                 )
                 if update is None:
                     continue
-                static_tables[column_index] += self.learning_rate * update
-                fit_score += self.learning_rate * update[static_bins[column_index][fit_indices]]
-                validation_score += self.learning_rate * update[static_bins[column_index][validation_indices]]
+                update *= self.learning_rate
+                table += update
+                fit_score += update[static_bins[column_index][fit_indices]]
+                validation_score += update[static_bins[column_index][validation_indices]]
 
-            validation_loss = log_loss(
-                target[validation_indices], expit(validation_score),
-                sample_weight=weights[validation_indices], labels=[0, 1],
-            )
-            if validation_loss < best_loss - 1e-6:
-                best_loss = validation_loss
-                best_state = (intercept, [table.copy() for table in feature_tables],
-                              [table.copy() for table in static_tables])
-                best_round = round_index
-                rounds_without_improvement = 0
-            else:
-                rounds_without_improvement += 1
-                if rounds_without_improvement >= self.early_stopping_rounds:
-                    break
+        def snapshot():
+            return [table.copy() for table in feature_tables], [table.copy() for table in static_tables]
 
-        if best_state is None:
-            best_state = (intercept, feature_tables, static_tables)
-        return (*best_state, best_round)
+        return boost_bag(update_terms, snapshot, fit_target, fit_weight,
+                         target[validation_indices], weights[validation_indices],
+                         self.learning_rate, self.max_rounds, self.early_stopping_rounds)
 
     def predict_proba(self, values, observed, static_values):
         values = np.asarray(values, dtype=np.float32)

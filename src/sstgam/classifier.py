@@ -8,7 +8,6 @@ from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils.validation import check_is_fitted
 
 from .boosting import SharedShapeTemporalGAMBoost
-from .normalization import apply_quantile_tables
 from .tree_boost import SharedShapeTemporalGAMTreeBoost
 
 _TEMPORAL_COLUMN_PATTERN = re.compile(r"^(.+)_(\d+)$")
@@ -48,11 +47,28 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         penalty, so smoothness is controlled the same way regardless of
         basis. Ignored when ``method="tree"``.
     value_transform : {"quantile", "zscore"}, default="quantile"
-        Per-feature value normalization for the spline method.
-    temporal_penalty, static_penalty : float
-        Smoothness penalties for spline temporal and static effects.
+        Per-feature value normalization for the spline method, applied to
+        temporal values and static covariates alike.
+    temporal_penalty, static_penalty : float or "auto", default="auto"
+        Smoothness penalties for spline temporal and static effects. The
+        right value depends on how much information each coefficient gets
+        and differs by orders of magnitude between datasets. With
+        ``"auto"``, terms share one penalty chosen by held-out log loss (a
+        short search from a starting guess of ~100 x coefficients per
+        minority-class example, picking the smoothest penalty within one
+        standard error of the best), then the model is refit on all rows.
+        The held-out loss comes from one ``val_fraction`` split when that
+        split holds at least 500 minority-class examples, otherwise from
+        5-fold cross-validation, which is slower but stable on small data. The chosen values are on ``model_`` as
+        ``temporal_penalty_`` / ``static_penalty_``, and every value tried
+        with its validation loss as ``penalty_search_``.
+    val_fraction : float, default=0.15
+        Held-out fraction: the tree method's early-stopping split, and the
+        spline method's ``"auto"`` penalty search.
     learning_rate, max_rounds, early_stopping_rounds
-        Boosting controls shared by both methods.
+        Boosting controls for the tree method. The spline method has no
+        boosting rounds: it solves its penalized fit directly by P-IRLS, so
+        it ignores these.
     outer_bags : int, default=4
         Number of bootstrap-resampled fits (the validation split is fixed
         across bags) whose coefficients/tables are averaged at the end --
@@ -67,8 +83,8 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         anything about which times or features that applies to. Off by
         default; see ``ARCHITECTURE.md`` for the missingness assumption this
         opts out of.
-    val_fraction, random_state
-        Validation split and random seed.
+    random_state
+        Random seed (validation split, bootstrap bags, tree fitting).
     """
 
     def __init__(
@@ -81,8 +97,8 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         tree_depth: int = 3,
         basis: str = "rbf",
         value_transform: str = "quantile",
-        temporal_penalty: float = 1.0,
-        static_penalty: float = 1.0,
+        temporal_penalty: float | str = "auto",
+        static_penalty: float | str = "auto",
         learning_rate: float = 0.02,
         max_rounds: int = 100,
         outer_bags: int = 4,
@@ -213,6 +229,9 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         self._temporal_columns = temporal_columns
         self._static_column_indices = static_columns
         self.temporal_features_ = sorted(temporal_columns)
+        self.static_features_ = [names[index] for index in static_columns]
+        if self.include_missingness_indicators:
+            self.static_features_ += [f"{name}_observed_fraction" for name in self.temporal_features_]
         self.time_ids_ = sorted({
             time_id for feature_name in self.temporal_features_
             for time_id in temporal_columns[feature_name]
@@ -253,47 +272,36 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         check_is_fitted(self, "model_")
         return list(self.temporal_features_)
 
-    def _normalise_feature_values(self, feature_index: int, raw_values) -> np.ndarray:
-        values = np.asarray(raw_values, dtype=np.float32)
-        if self.value_transform == "quantile":
-            return apply_quantile_tables(
-                values.reshape(1, 1, -1), [self.model_._quantile_tables[feature_index]], self.model_.clip
-            ).reshape(values.shape)
-        scaled = ((values - self.model_._feature_center[feature_index]) /
-                  self.model_._feature_scale[feature_index])
-        return np.clip(scaled, -self.model_.clip, self.model_.clip)
-
-    def _normalise_time(self, time_values) -> np.ndarray:
-        lower, upper = float(self.time_ids_[0]), float(self.time_ids_[-1])
-        return (np.asarray(time_values, dtype=np.float32) - lower) / max(upper - lower, 1.0)
-
     def _validate_hyperparameters(self) -> None:
         if self.method not in {"spline", "tree"}:
             raise ValueError(f"method must be 'spline' or 'tree', got {self.method!r}")
         if self.basis not in {"rbf", "bspline"}:
             raise ValueError(f"basis must be 'rbf' or 'bspline', got {self.basis!r}")
+        if self.value_transform not in {"quantile", "zscore"}:
+            raise ValueError(f"value_transform must be 'quantile' or 'zscore', got {self.value_transform!r}")
         if min(self.n_value_bases, self.n_time_bases, self.n_static_bases,
                self.n_value_bins, self.tree_depth) < 1:
             raise ValueError("Basis counts, bin count, and tree_depth must be positive.")
-        if min(self.temporal_penalty, self.static_penalty, self.learning_rate) <= 0:
-            raise ValueError("Penalties and learning_rate must be positive.")
+        for name in ("temporal_penalty", "static_penalty"):
+            value = getattr(self, name)
+            if value != "auto" and (isinstance(value, str) or value <= 0):
+                raise ValueError(f"{name} must be 'auto' or a positive number, got {value!r}")
+        if self.learning_rate <= 0:
+            raise ValueError("learning_rate must be positive.")
         if self.max_rounds < 1 or self.early_stopping_rounds < 1 or self.outer_bags < 1:
             raise ValueError("max_rounds, early_stopping_rounds, and outer_bags must be positive.")
 
     def _make_trainer(self):
-        common_arguments = dict(
-            learning_rate=self.learning_rate,
-            max_rounds=self.max_rounds,
-            outer_bags=self.outer_bags,
-            early_stopping_rounds=self.early_stopping_rounds,
-            val_fraction=self.val_fraction,
-            random_state=self.random_state,
-        )
         if self.method == "tree":
             return SharedShapeTemporalGAMTreeBoost(
                 n_value_bins=self.n_value_bins,
                 max_depth=self.tree_depth,
-                **common_arguments,
+                learning_rate=self.learning_rate,
+                max_rounds=self.max_rounds,
+                outer_bags=self.outer_bags,
+                early_stopping_rounds=self.early_stopping_rounds,
+                val_fraction=self.val_fraction,
+                random_state=self.random_state,
             )
         return SharedShapeTemporalGAMBoost(
             n_value_bases=self.n_value_bases,
@@ -303,7 +311,9 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
             value_transform=self.value_transform,
             temporal_penalty=self.temporal_penalty,
             static_penalty=self.static_penalty,
-            **common_arguments,
+            outer_bags=self.outer_bags,
+            val_fraction=self.val_fraction,
+            random_state=self.random_state,
         )
 
     def value_effect(self, feature: str, values, return_interval: bool = False) -> _Effect:
@@ -318,7 +328,7 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
             raise ValueError("value_effect is only available when method='spline'.")
         check_is_fitted(self, "model_")
         feature_index = self.temporal_features_.index(feature)
-        normalized_values = self._normalise_feature_values(feature_index, np.atleast_1d(values))
+        normalized_values = self.model_.normalize_values(feature_index, np.atleast_1d(values))
         return self.model_.mean_value_effect_normalized(
             feature_index, normalized_values, return_interval=return_interval
         )
@@ -335,11 +345,24 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
             raise ValueError("temporal_surface is only available when method='spline'.")
         check_is_fitted(self, "model_")
         feature_index = self.temporal_features_.index(feature)
-        normalized_values = self._normalise_feature_values(feature_index, values)
-        normalized_time = self._normalise_time(time_coordinates)
+        normalized_values = self.model_.normalize_values(feature_index, values)
+        normalized_time = self.model_.normalize_time(time_coordinates)
         return self.model_.temporal_surface_normalized(
             feature_index, normalized_values, normalized_time, return_interval=return_interval
         )
+
+    def static_effect(self, feature: str, values) -> np.ndarray:
+        """Return the fitted log-odds effect of a static covariate at ``values``.
+
+        ``feature`` is a static column name, or ``<temporal_feature>_observed_fraction``
+        for a missingness indicator. Missing values get the effect the model
+        uses for them at prediction time. Spline effects average zero over the
+        training rows.
+        """
+        check_is_fitted(self, "model_")
+        if feature not in self.static_features_:
+            raise ValueError(f"Unknown static feature {feature!r}; fitted static features: {self.static_features_}")
+        return self.model_.static_effect(self.static_features_.index(feature), np.atleast_1d(values))
 
     def value_time_table(self, feature: str, return_interval: bool = False) -> tuple[np.ndarray, ...]:
         """Return the tree backend's fitted value-bin by time-bin table.
