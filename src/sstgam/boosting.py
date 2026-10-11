@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import numpy as np
+from scipy.special import expit
+from sklearn.metrics import log_loss
 
-from ._training import make_validation_split, weighted_log_loss
-from .bases import make_rbf_centers, rbf_np, second_diff_matrix_np
+from ._training import make_validation_split
+from .bases import basis_design, make_basis_params, second_diff_matrix_np
 from .normalization import apply_value_normalization, fit_value_normalization, static_stats
 
 _NORMALIZATION_CLIP = 4.0
@@ -13,7 +15,15 @@ _RIDGE = 1e-6
 
 
 class SharedShapeTemporalGAMBoost:
-    """Cyclic Newton boosting over smooth value-time feature surfaces.
+    """Cyclic gradient boosting over smooth value-time feature surfaces.
+
+    Each coordinate-block update uses a fixed quasi-Newton step: the
+    preconditioner (``_preconditioner``) inverts a penalized worst-case
+    Hessian bound (``p = 0.5``) computed once per bag, not the true
+    per-round Hessian ``p * (1 - p)``. This is a majorization-minimization /
+    IRLS-style bound, not literal Newton's method -- the step direction is
+    curvature-informed but the curvature estimate is not updated as the fit
+    improves.
 
     ``outer_bags`` bagged fits (fixed validation split, bootstrapped
     training rows) are averaged at the end, as in EBM.
@@ -24,6 +34,7 @@ class SharedShapeTemporalGAMBoost:
         n_value_bases: int = 8,
         n_time_bases: int = 5,
         n_static_bases: int = 8,
+        basis: str = "rbf",
         value_transform: str = "quantile",
         temporal_penalty: float = 1.0,
         static_penalty: float = 1.0,
@@ -33,11 +44,11 @@ class SharedShapeTemporalGAMBoost:
         early_stopping_rounds: int = 15,
         val_fraction: float = 0.15,
         random_state: int = 42,
-        verbose: int = 0,
     ) -> None:
         self.n_value_bases = n_value_bases
         self.n_time_bases = n_time_bases
         self.n_static_bases = n_static_bases
+        self.basis = basis
         self.value_transform = value_transform
         self.temporal_penalty = temporal_penalty
         self.static_penalty = static_penalty
@@ -47,7 +58,6 @@ class SharedShapeTemporalGAMBoost:
         self.early_stopping_rounds = early_stopping_rounds
         self.val_fraction = val_fraction
         self.random_state = random_state
-        self.verbose = verbose
         self.clip = _NORMALIZATION_CLIP
 
     @staticmethod
@@ -55,10 +65,8 @@ class SharedShapeTemporalGAMBoost:
                         strength: float) -> np.ndarray:
         value_difference = second_diff_matrix_np(n_value_bases)
         time_difference = second_diff_matrix_np(n_time_bases)
-        value_penalty = (value_difference.T @ value_difference if value_difference.size
-                         else np.zeros((n_value_bases, n_value_bases)))
-        time_penalty = (time_difference.T @ time_difference if time_difference.size
-                        else np.zeros((n_time_bases, n_time_bases)))
+        value_penalty = value_difference.T @ value_difference
+        time_penalty = time_difference.T @ time_difference
         return strength * (
             np.kron(value_penalty, np.eye(n_time_bases)) +
             np.kron(np.eye(n_value_bases), time_penalty) +
@@ -68,8 +76,7 @@ class SharedShapeTemporalGAMBoost:
     @staticmethod
     def _static_penalty(n_bases: int, strength: float) -> np.ndarray:
         difference = second_diff_matrix_np(n_bases)
-        roughness = difference.T @ difference if difference.size else np.zeros((n_bases, n_bases))
-        return strength * roughness + _RIDGE * np.eye(n_bases)
+        return strength * (difference.T @ difference) + _RIDGE * np.eye(n_bases)
 
     @staticmethod
     def _preconditioner(design_matrix, sample_weight, penalty):
@@ -89,8 +96,8 @@ class SharedShapeTemporalGAMBoost:
             (n_samples, n_features, self.n_value_bases * self.n_time_bases), dtype=np.float32
         )
         for feature_index in range(n_features):
-            value_basis = rbf_np(normalized_values[:, feature_index, :],
-                                 self._value_centers, self._value_bandwidth)
+            value_basis = basis_design(self.basis, normalized_values[:, feature_index, :],
+                                       self._value_basis_a, self._value_basis_b)
             masked_basis = value_basis * observed[:, feature_index, :, None]
             temporal_design[:, feature_index, :] = np.einsum(
                 "ndp,dq->npq", masked_basis, self._time_basis
@@ -103,8 +110,8 @@ class SharedShapeTemporalGAMBoost:
         normalized_static = (filled_static - self._static_mean) / self._static_scale
         np.clip(normalized_static, -self.clip, self.clip, out=normalized_static)
         static_design = np.stack([
-            rbf_np(normalized_static[:, column_index], self._static_centers,
-                   self._static_bandwidth)
+            basis_design(self.basis, normalized_static[:, column_index],
+                        self._static_basis_a, self._static_basis_b)
             for column_index in range(static_values.shape[1])
         ], axis=1)
         return temporal_design, static_design
@@ -114,7 +121,7 @@ class SharedShapeTemporalGAMBoost:
                       coefficients, train_score, validation_score,
                       target, sample_weight, learning_rate):
         for unit_index, preconditioner in enumerate(preconditioners):
-            probability = 1.0 / (1.0 + np.exp(-train_score))
+            probability = expit(train_score)
             residual = sample_weight * (target - probability)
             coefficient_update = preconditioner @ (train_design[:, unit_index, :].T @ residual)
             coefficients[unit_index] += learning_rate * coefficient_update
@@ -137,18 +144,17 @@ class SharedShapeTemporalGAMBoost:
         )
         self._static_mean, self._static_scale = static_stats(static_values)
         value_span = self.clip if self.value_transform == "quantile" else 0.9 * self.clip
-        self._value_centers, self._value_bandwidth = make_rbf_centers(
-            -value_span, value_span, self.n_value_bases
+        self._value_basis_a, self._value_basis_b = make_basis_params(
+            self.basis, -value_span, value_span, self.n_value_bases
         )
-        self._static_centers, self._static_bandwidth = make_rbf_centers(
-            -0.9 * self.clip, 0.9 * self.clip, self.n_static_bases
+        self._static_basis_a, self._static_basis_b = make_basis_params(
+            self.basis, -0.9 * self.clip, 0.9 * self.clip, self.n_static_bases
         )
         time_coordinates = np.asarray(time_coordinates, dtype=np.float32)
-        self._time_min = float(time_coordinates.min())
-        self._time_range = max(float(time_coordinates.max() - time_coordinates.min()), 1.0)
-        normalized_time = (time_coordinates - self._time_min) / self._time_range
-        self._time_centers, self._time_bandwidth = make_rbf_centers(0.0, 1.0, self.n_time_bases)
-        self._time_basis = rbf_np(normalized_time, self._time_centers, self._time_bandwidth)
+        time_range = max(float(time_coordinates.max() - time_coordinates.min()), 1.0)
+        normalized_time = (time_coordinates - time_coordinates.min()) / time_range
+        self._time_basis_a, self._time_basis_b = make_basis_params(self.basis, 0.0, 1.0, self.n_time_bases)
+        self._time_basis = basis_design(self.basis, normalized_time, self._time_basis_a, self._time_basis_b)
 
         temporal_design, static_design = self._build_designs(
             normalized_training_values, observed, static_values
@@ -164,10 +170,10 @@ class SharedShapeTemporalGAMBoost:
         )
 
         rng = np.random.RandomState(self.random_state)
-        accumulated_intercept = 0.0
-        accumulated_temporal = None
-        accumulated_static = None
         self.best_rounds_ = []
+        self._bagged_intercepts = []
+        self._bagged_temporal_coefficients = []
+        self._bagged_static_coefficients = []
         for _ in range(self.outer_bags):
             fit_indices = (train_indices if self.outer_bags == 1
                           else rng.choice(train_indices, size=train_indices.size, replace=True))
@@ -177,19 +183,14 @@ class SharedShapeTemporalGAMBoost:
                 temporal_penalty, static_penalty, rng,
             )
             self.best_rounds_.append(best_round)
-            accumulated_intercept += intercept
-            if accumulated_temporal is None:
-                accumulated_temporal = temporal_coefficients
-                accumulated_static = static_coefficients
-            else:
-                accumulated_temporal = accumulated_temporal + temporal_coefficients
-                if static_coefficients is not None:
-                    accumulated_static = accumulated_static + static_coefficients
+            self._bagged_intercepts.append(intercept)
+            self._bagged_temporal_coefficients.append(temporal_coefficients)
+            self._bagged_static_coefficients.append(static_coefficients)
 
-        self._intercept = accumulated_intercept / self.outer_bags
-        self._temporal_coefficients = accumulated_temporal / self.outer_bags
-        self._static_coefficients = (None if accumulated_static is None
-                                     else accumulated_static / self.outer_bags)
+        self._intercept = float(np.mean(self._bagged_intercepts))
+        self._temporal_coefficients = np.mean(self._bagged_temporal_coefficients, axis=0)
+        self._static_coefficients = (None if static_design is None
+                                     else np.mean(self._bagged_static_coefficients, axis=0))
         return self
 
     def _fit_one_bag(self, temporal_design, static_design, target, sample_weight,
@@ -223,7 +224,7 @@ class SharedShapeTemporalGAMBoost:
         best_round = 0
         rounds_without_improvement = 0
         for round_index in range(1, self.max_rounds + 1):
-            probability = 1.0 / (1.0 + np.exp(-fit_score))
+            probability = expit(fit_score)
             residual = fit_weight * (fit_target - probability)
             intercept_update = residual.sum() / max(0.25 * fit_weight.sum(), _RIDGE)
             intercept += self.learning_rate * intercept_update
@@ -240,8 +241,8 @@ class SharedShapeTemporalGAMBoost:
                     fit_target, fit_weight, self.learning_rate,
                 )
 
-            validation_probability = 1.0 / (1.0 + np.exp(-validation_score))
-            validation_loss = weighted_log_loss(validation_target, validation_probability, validation_weight)
+            validation_loss = log_loss(validation_target, expit(validation_score),
+                                       sample_weight=validation_weight, labels=[0, 1])
             if validation_loss < best_loss - 1e-6:
                 best_loss = validation_loss
                 best_state = (intercept, temporal_coefficients.copy(),
@@ -269,23 +270,73 @@ class SharedShapeTemporalGAMBoost:
         score += np.einsum("nfp,fp->n", temporal_design, self._temporal_coefficients)
         if static_design is not None:
             score += np.einsum("nsp,sp->n", static_design, self._static_coefficients)
-        probability = 1.0 / (1.0 + np.exp(-score))
-        return np.clip(probability, 1e-6, 1.0 - 1e-6)
+        return np.clip(expit(score), 1e-6, 1.0 - 1e-6)
+
+    def predict_proba_per_bag(self, values, observed, static_values) -> np.ndarray:
+        """Return each bag's own (unaveraged) predicted probability, shape ``(outer_bags, n_samples)``.
+
+        Exposes the bagging variance-reduction property directly: the final
+        ``predict_proba`` is the bag-averaged score passed through the
+        logistic link, not the average of these per-bag probabilities, but
+        the spread across rows here is what averaging the bags reduces.
+        """
+        normalized_values = apply_value_normalization(
+            np.asarray(values, dtype=np.float32), self.value_transform,
+            self._quantile_tables, self.clip,
+        )
+        temporal_design, static_design = self._build_designs(
+            normalized_values, observed, static_values
+        )
+        probabilities = []
+        for bag_index in range(len(self._bagged_intercepts)):
+            score = np.full(temporal_design.shape[0], self._bagged_intercepts[bag_index])
+            score += np.einsum("nfp,fp->n", temporal_design, self._bagged_temporal_coefficients[bag_index])
+            if static_design is not None:
+                score += np.einsum("nsp,sp->n", static_design, self._bagged_static_coefficients[bag_index])
+            probabilities.append(expit(score))
+        return np.clip(np.stack(probabilities, axis=0), 1e-6, 1.0 - 1e-6)
+
+    def _bagged_surfaces(self, feature_index: int, value_grid, normalized_time_grid) -> np.ndarray:
+        """Stack one fitted value-time surface per bag: shape (n_bags, len(value_grid), len(time_grid))."""
+        value_basis = basis_design(self.basis, np.asarray(value_grid, dtype=np.float32),
+                                   self._value_basis_a, self._value_basis_b)
+        time_basis = basis_design(self.basis, np.asarray(normalized_time_grid, dtype=np.float32),
+                                  self._time_basis_a, self._time_basis_b)
+        return np.stack([
+            value_basis @ bag_coefficients[feature_index].reshape(self.n_value_bases, self.n_time_bases) @ time_basis.T
+            for bag_coefficients in self._bagged_temporal_coefficients
+        ], axis=0)
 
     def temporal_surface_normalized(self, feature_index: int, value_grid,
-                                    normalized_time_grid) -> np.ndarray:
-        """Evaluate one fitted value-time surface on normalized coordinates."""
-        value_basis = rbf_np(np.asarray(value_grid, dtype=np.float32),
-                             self._value_centers, self._value_bandwidth)
-        time_basis = rbf_np(np.asarray(normalized_time_grid, dtype=np.float32),
-                            self._time_centers, self._time_bandwidth)
-        coefficients = self._temporal_coefficients[feature_index].reshape(
-            self.n_value_bases, self.n_time_bases
-        )
-        return value_basis @ coefficients @ time_basis.T
+                                    normalized_time_grid, return_interval: bool = False):
+        """Evaluate one fitted value-time surface on normalized coordinates.
 
-    def mean_value_effect_normalized(self, feature_index: int, value_grid) -> np.ndarray:
-        surface = self.temporal_surface_normalized(
-            feature_index, value_grid, np.linspace(0.0, 1.0, self.n_time_bases * 3)
-        )
-        return surface.mean(axis=1)
+        With ``return_interval=True``, returns a ``(lower, mean, upper)``
+        bootstrap percentile band (2.5/97.5) computed across the
+        ``outer_bags`` bagged fits instead of a single point estimate. With
+        ``outer_bags=1`` the band collapses to the point estimate.
+        """
+        if not return_interval:
+            value_basis = basis_design(self.basis, np.asarray(value_grid, dtype=np.float32),
+                                       self._value_basis_a, self._value_basis_b)
+            time_basis = basis_design(self.basis, np.asarray(normalized_time_grid, dtype=np.float32),
+                                      self._time_basis_a, self._time_basis_b)
+            coefficients = self._temporal_coefficients[feature_index].reshape(
+                self.n_value_bases, self.n_time_bases
+            )
+            return value_basis @ coefficients @ time_basis.T
+
+        surfaces = self._bagged_surfaces(feature_index, value_grid, normalized_time_grid)
+        lower, upper = np.percentile(surfaces, [2.5, 97.5], axis=0)
+        return lower, surfaces.mean(axis=0), upper
+
+    def mean_value_effect_normalized(self, feature_index: int, value_grid,
+                                     return_interval: bool = False):
+        time_grid = np.linspace(0.0, 1.0, self.n_time_bases * 3)
+        if not return_interval:
+            surface = self.temporal_surface_normalized(feature_index, value_grid, time_grid)
+            return surface.mean(axis=1)
+
+        per_bag_effect = self._bagged_surfaces(feature_index, value_grid, time_grid).mean(axis=2)
+        lower, upper = np.percentile(per_bag_effect, [2.5, 97.5], axis=0)
+        return lower, per_bag_effect.mean(axis=0), upper

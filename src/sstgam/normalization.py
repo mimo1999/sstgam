@@ -32,14 +32,9 @@ def fit_quantile_tables(values: np.ndarray, observed: np.ndarray):
             tables.append((np.array([-1.0, 1.0]), np.array([-1.0, 1.0])))
             continue
 
-        sorted_values = np.sort(feature_values)
-        ranks = (np.arange(sorted_values.size) + 0.5) / sorted_values.size
-        unique_values, inverse = np.unique(sorted_values, return_inverse=True)
-        rank_sums = np.zeros(unique_values.size)
-        rank_counts = np.zeros(unique_values.size)
-        np.add.at(rank_sums, inverse, ranks)
-        np.add.at(rank_counts, inverse, 1.0)
-        unique_ranks = rank_sums / rank_counts
+        unique_values, counts = np.unique(feature_values, return_counts=True)
+        # Mean mid-rank of each tied group in the sorted values.
+        unique_ranks = (np.cumsum(counts) - counts / 2.0) / feature_values.size
         tables.append((unique_values.astype(np.float64), (2.0 * unique_ranks - 1.0).astype(np.float64)))
     return tables
 

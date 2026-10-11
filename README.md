@@ -5,13 +5,18 @@ classification with multiple time-varying features. It fits one shared
 value-time effect per feature, so the effect of a value can change smoothly or
 discretely over time while remaining directly inspectable.
 
+See [ARCHITECTURE.md](https://github.com/mimo1999/sstgam/blob/main/ARCHITECTURE.md) for the model design and its
+stated assumptions/limits, and [BENCHMARKS.md](https://github.com/mimo1999/sstgam/blob/main/BENCHMARKS.md) for
+comparative results against other model families.
+
 ## Installation
 
 ```bash
-pip install -e .
+pip install sstgam
 ```
 
-The package depends only on NumPy and scikit-learn.
+The package depends only on NumPy, SciPy, and scikit-learn. The examples below
+use pandas, which is optional (`pip install pandas`).
 
 ## Data format
 
@@ -20,7 +25,10 @@ The package depends only on NumPy and scikit-learn.
 other columns are treated as static covariates.
 
 When fitting a NumPy array instead of a DataFrame, pass the matching column
-names explicitly through `feature_names`.
+names explicitly through `feature_names`. Inside a scikit-learn `Pipeline` or
+`GridSearchCV`, column names are only preserved if every preceding step
+outputs DataFrames, e.g. `preprocessor.set_output(transform="pandas")`;
+otherwise `fit` sees no temporal columns and raises an error.
 
 For example:
 
@@ -70,8 +78,12 @@ one-dimensional static effect. This is an additive time-varying model: it
 does not directly model lags, slopes, or interactions between successive
 measurements. Supply those as input features if they are needed.
 
-Both methods are fitted by cyclic Newton boosting with early stopping on
-validation log loss, and are bagged: `outer_bags` independent fits are run on
+Both methods are fitted by cyclic (coordinate-descent) gradient boosting with
+early stopping on validation log loss. The tree method's leaf values are true
+per-round Newton steps (fresh gradient/Hessian each round); the spline
+method's coefficient updates use a fixed quasi-Newton preconditioner from a
+worst-case Hessian bound computed once per bag (see [ARCHITECTURE.md](https://github.com/mimo1999/sstgam/blob/main/ARCHITECTURE.md)). Both
+methods are bagged: `outer_bags` independent fits are run on
 bootstrap resamples of the training rows (the validation split is held fixed
 across bags) and their fitted parameters are averaged. Averaging leaves the
 model in the same form — a mean of coefficient vectors over a shared basis is
@@ -80,9 +92,11 @@ so bagging reduces variance without changing what `f_k` is.
 
 ## Methods
 
-- `method="spline"` (default) uses smooth Gaussian radial-basis surfaces with
+- `method="spline"` (default) uses smooth tensor-product surfaces with
   roughness penalties. Use this when you want smooth effect plots and support
-  for irregular numeric time coordinates.
+  for irregular numeric time coordinates. Set `basis="rbf"` (default) for
+  fixed-bandwidth Gaussian bumps or `basis="bspline"` for a clamped B-spline
+  basis of the same size; both use the same roughness penalty.
 - `method="tree"` uses quantile value bins and shallow tree updates to learn a
   discrete value-time table. Use `value_time_table(feature)` to inspect it.
 
@@ -91,9 +105,13 @@ tree pick freely. Depth-1 candidate splits are fitted on the value axis and the
 time axis separately and scored by weighted-SSE gain minus `2 * log(m)`, where
 `m` is the number of distinct candidate thresholds on that axis; the
 higher-scoring axis splits first and the other refines within each resulting
-group. The penalty is a Bonferroni/BIC-style multiplicity correction: without
-it the value axis wins on candidate count alone, since it usually has more
-quantile bins than there are observation times.
+group. This is a candidate-count penalty on greedy SSE gain, not a formal
+Bonferroni or BIC correction (there is no p-value or likelihood term here) —
+just the same intuition: an axis with more candidate thresholds gets more
+chances for a greedy split to look good by chance, so the penalty scales with
+the log of the candidate count. Without it the value axis wins on candidate
+count alone, since it usually has more quantile bins than there are
+observation times.
 
 For spline models, inspect fitted effects with:
 
@@ -115,3 +133,8 @@ surface = model.temporal_surface(
   bagging and fit once on the full training split; cost scales linearly.
 - `value_transform`: use `"quantile"` for robust rank-based scaling or
   `"zscore"` for robust center/scale normalization.
+- `include_missingness_indicators` (default `False`): adds one extra static
+  covariate per temporal feature (its per-sample observed-fraction), so the
+  model can learn from informative missingness instead of assuming
+  unobserved cells carry no information. See [ARCHITECTURE.md](https://github.com/mimo1999/sstgam/blob/main/ARCHITECTURE.md) for the
+  assumption this opts out of.

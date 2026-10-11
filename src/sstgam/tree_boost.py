@@ -1,14 +1,21 @@
 """Histogram-based value-time GAM backend."""
 
 import numpy as np
+from scipy.special import expit
+from sklearn.metrics import log_loss
 from sklearn.tree import DecisionTreeRegressor
 
-from ._training import make_validation_split, weighted_log_loss
+from ._training import make_validation_split
 
 _MIN_HESSIAN = 1e-6
+_N_STATIC_BINS = 16
 
 # Per-log-candidate-count penalty on split gain, correcting CART's bias
-# toward axes with more candidate thresholds (Bonferroni/BIC-style).
+# toward axes with more candidate thresholds. Not a formal Bonferroni or BIC
+# correction -- there is no p-value or likelihood term here -- just a
+# candidate-count penalty on greedy SSE gain, in the same spirit as those
+# corrections (more candidates give a greedy split more chances to look good
+# by chance, so the penalty scales with log of the candidate count).
 _AXIS_PENALTY_LAMBDA = 2.0
 
 # Depth of whichever axis splits first each round; the rest of max_depth
@@ -44,7 +51,6 @@ class SharedShapeTemporalGAMTreeBoost:
     def __init__(
         self,
         n_value_bins: int = 16,
-        n_static_bins: int = 16,
         max_depth: int = 3,
         learning_rate: float = 0.02,
         max_rounds: int = 100,
@@ -52,10 +58,8 @@ class SharedShapeTemporalGAMTreeBoost:
         early_stopping_rounds: int = 15,
         val_fraction: float = 0.15,
         random_state: int = 42,
-        verbose: int = 0,
     ) -> None:
         self.n_value_bins = n_value_bins
-        self.n_static_bins = n_static_bins
         self.max_depth = max_depth
         self.learning_rate = learning_rate
         self.max_rounds = max_rounds
@@ -63,7 +67,6 @@ class SharedShapeTemporalGAMTreeBoost:
         self.early_stopping_rounds = early_stopping_rounds
         self.val_fraction = val_fraction
         self.random_state = random_state
-        self.verbose = verbose
 
     @staticmethod
     def _bin(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
@@ -81,7 +84,7 @@ class SharedShapeTemporalGAMTreeBoost:
             column = static_values[:, column_index]
             finite_values = column[np.isfinite(column)]
             self._static_fill[column_index] = np.median(finite_values) if finite_values.size else 0.0
-            self._static_edges.append(_quantile_edges(finite_values, self.n_static_bins))
+            self._static_edges.append(_quantile_edges(finite_values, _N_STATIC_BINS))
 
     def _feature_bins(self, values) -> list[np.ndarray]:
         return [self._bin(np.nan_to_num(values[:, feature_index, :], nan=0.0), edges)
@@ -185,7 +188,7 @@ class SharedShapeTemporalGAMTreeBoost:
 
     @staticmethod
     def _grad_hess(score, target, weight):
-        probability = 1.0 / (1.0 + np.exp(-score))
+        probability = expit(score)
         gradient = weight * (target - probability)
         hessian = weight * probability * (1.0 - probability)
         return gradient, hessian
@@ -206,7 +209,6 @@ class SharedShapeTemporalGAMTreeBoost:
         feature_bins = self._feature_bins(values)
         static_bins = self._static_bins(static_values)
         n_value_bins = [len(edges) - 1 for edges in self._value_edges]
-        self.effective_value_bins_ = np.asarray(n_value_bins)
 
         time_coordinates = np.asarray(time_coordinates, dtype=np.float64)
         time_scale = max(float(time_coordinates.max() - time_coordinates.min()), 1.0)
@@ -231,10 +233,10 @@ class SharedShapeTemporalGAMTreeBoost:
         )
 
         rng = np.random.RandomState(self.random_state)
-        accumulated_intercept = 0.0
-        accumulated_feature_tables = None
-        accumulated_static_tables = None
         self.best_rounds_ = []
+        bagged_intercepts = []
+        self._bagged_feature_tables = []
+        bagged_static_tables = []
         for _ in range(self.outer_bags):
             fit_indices = (train_indices if self.outer_bags == 1
                           else rng.choice(train_indices, size=train_indices.size, replace=True))
@@ -245,17 +247,13 @@ class SharedShapeTemporalGAMTreeBoost:
                 static_coordinates, rng,
             )
             self.best_rounds_.append(best_round)
-            accumulated_intercept += intercept
-            if accumulated_feature_tables is None:
-                accumulated_feature_tables = feature_tables
-                accumulated_static_tables = static_tables
-            else:
-                accumulated_feature_tables = [a + b for a, b in zip(accumulated_feature_tables, feature_tables)]
-                accumulated_static_tables = [a + b for a, b in zip(accumulated_static_tables, static_tables)]
+            bagged_intercepts.append(intercept)
+            self._bagged_feature_tables.append(feature_tables)
+            bagged_static_tables.append(static_tables)
 
-        self._intercept = accumulated_intercept / self.outer_bags
-        self._feature_tables = [table / self.outer_bags for table in accumulated_feature_tables]
-        self._static_tables = [table / self.outer_bags for table in accumulated_static_tables]
+        self._intercept = float(np.mean(bagged_intercepts))
+        self._feature_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_feature_tables)]
+        self._static_tables = [np.mean(tables, axis=0) for tables in zip(*bagged_static_tables)]
         return self
 
     def _fit_one_bag(self, weights, target, observed, fit_indices, validation_indices,
@@ -315,9 +313,9 @@ class SharedShapeTemporalGAMTreeBoost:
                 fit_score += self.learning_rate * update[static_bins[column_index][fit_indices]]
                 validation_score += self.learning_rate * update[static_bins[column_index][validation_indices]]
 
-            validation_probability = 1.0 / (1.0 + np.exp(-validation_score))
-            validation_loss = weighted_log_loss(
-                target[validation_indices], validation_probability, weights[validation_indices]
+            validation_loss = log_loss(
+                target[validation_indices], expit(validation_score),
+                sample_weight=weights[validation_indices], labels=[0, 1],
             )
             if validation_loss < best_loss - 1e-6:
                 best_loss = validation_loss
@@ -345,14 +343,24 @@ class SharedShapeTemporalGAMTreeBoost:
         if self._static_tables:
             for column_index, bins in enumerate(self._static_bins(static_values)):
                 score += self._static_tables[column_index][bins]
-        probability = 1.0 / (1.0 + np.exp(-score))
-        return np.clip(probability, 1e-6, 1.0 - 1e-6)
+        return np.clip(expit(score), 1e-6, 1.0 - 1e-6)
 
-    def value_time_table(self, feature_index: int):
-        """Return ``(value_bin_edges, log_odds_table)`` for one feature."""
-        return (self._value_edges[feature_index],
-                self._feature_tables[feature_index].reshape(-1, self._n_times))
+    def value_time_table(self, feature_index: int, return_interval: bool = False):
+        """Return ``(value_bin_edges, log_odds_table)`` for one feature.
 
-    def static_effect_table(self, column_index: int):
-        """Return ``(bin_edges, log_odds_effect)`` for one static covariate."""
-        return self._static_edges[column_index], self._static_tables[column_index]
+        With ``return_interval=True``, returns
+        ``(value_bin_edges, lower, mean, upper)`` -- a 2.5/97.5 bootstrap
+        percentile band computed across the ``outer_bags`` bagged fits
+        instead of a single table. With ``outer_bags=1`` the band collapses
+        to the point estimate.
+        """
+        if not return_interval:
+            return (self._value_edges[feature_index],
+                    self._feature_tables[feature_index].reshape(-1, self._n_times))
+
+        tables = np.stack([
+            bag_tables[feature_index].reshape(-1, self._n_times)
+            for bag_tables in self._bagged_feature_tables
+        ], axis=0)
+        lower, upper = np.percentile(tables, [2.5, 97.5], axis=0)
+        return self._value_edges[feature_index], lower, tables.mean(axis=0), upper

@@ -2,16 +2,26 @@
 Basis-function and roughness-penalty primitives for the Shared-Shape Temporal
 GAM.
 
-Every shape function in this model is a linear combination of fixed radial
-(Gaussian) basis functions placed on a regular grid in a *normalised*
-coordinate. A second-difference penalty on *adjacent* coefficients yields
-the "penalise wiggliness" smoothing a penalised spline gives, so the shape
+Every shape function in this model is a linear combination of fixed basis
+functions placed on a regular grid in a *normalised* coordinate. Two basis
+kinds are available, both parameterised the same way -- ``make_*_params(lo,
+hi, n)`` returns a ``(param_a, param_b)`` pair and ``*_np(z, param_a,
+param_b)`` evaluates the resulting ``(..., n)`` design matrix:
+
+- ``"rbf"``: fixed-bandwidth Gaussian bumps on evenly spaced centers.
+- ``"bspline"``: a clamped, evenly knotted B-spline basis.
+
+A second-difference penalty on *adjacent* coefficients yields the "penalise
+wiggliness" smoothing a penalised spline gives for either basis, so the shape
 functions stay interpretable and stable when observations are sparse.
 
 This module is pure numerics and can be unit-tested in isolation.
 """
 
 import numpy as np
+from scipy.interpolate import BSpline
+
+_BSPLINE_DEFAULT_DEGREE = 3
 
 
 def make_rbf_centers(lo: float, hi: float, n: int) -> tuple[np.ndarray, float]:
@@ -33,6 +43,58 @@ def rbf_np(z: np.ndarray, centers: np.ndarray, bandwidth: float) -> np.ndarray:
     return np.exp(-0.5 * d * d).astype(np.float32)
 
 
+def make_bspline_knots(lo: float, hi: float, n: int) -> tuple[np.ndarray, int]:
+    """Return a clamped, evenly spaced knot vector for ``n`` B-spline bases on ``[lo, hi]``.
+
+    The degree is capped at ``n - 1`` so a valid (non-empty) basis exists even
+    for a small ``n``. Clamping (knot multiplicity ``degree + 1`` at both
+    ends) makes the first and last basis functions interpolate the domain
+    boundary, matching how the RBF centers span ``[lo, hi]``.
+    """
+    n = max(int(n), 1)
+    degree = min(_BSPLINE_DEFAULT_DEGREE, n - 1)
+    n_interior = n - degree - 1
+    interior = np.linspace(lo, hi, n_interior + 2, dtype=np.float64)[1:-1] if n_interior > 0 else (
+        np.empty(0, dtype=np.float64)
+    )
+    knots = np.concatenate([
+        np.full(degree + 1, lo, dtype=np.float64),
+        interior,
+        np.full(degree + 1, hi, dtype=np.float64),
+    ]).astype(np.float32)
+    return knots, degree
+
+
+def bspline_np(z: np.ndarray, knots: np.ndarray, degree: int) -> np.ndarray:
+    """NumPy B-spline design matrix.
+
+    ``z`` shape (...) -> output (..., P) where ``P = len(knots) - degree - 1``.
+    Points outside ``[knots[degree], knots[-degree - 1]]`` are clamped to the
+    boundary, so the basis extrapolates as a constant rather than zeroing out.
+    """
+    knots = np.asarray(knots, dtype=np.float64)
+    z = np.asarray(z, dtype=np.float64)
+    clamped = np.clip(z, knots[degree], knots[knots.shape[0] - degree - 1]).ravel()
+    basis = BSpline.design_matrix(clamped, knots, degree).toarray()
+    return basis.reshape(z.shape + (-1,)).astype(np.float32)
+
+
+_BASES = {
+    "rbf": (make_rbf_centers, rbf_np),
+    "bspline": (make_bspline_knots, bspline_np),
+}
+
+
+def make_basis_params(basis: str, lo: float, hi: float, n: int):
+    """Dispatch to the parameter builder for ``basis`` ('rbf' or 'bspline')."""
+    return _BASES[basis][0](lo, hi, n)
+
+
+def basis_design(basis: str, z, param_a, param_b) -> np.ndarray:
+    """Dispatch to the design-matrix builder for ``basis`` ('rbf' or 'bspline')."""
+    return _BASES[basis][1](z, param_a, param_b)
+
+
 def second_diff_matrix_np(n: int) -> np.ndarray:
     """NumPy second-order difference operator, shape ``(n-2, n)``.
 
@@ -41,12 +103,4 @@ def second_diff_matrix_np(n: int) -> np.ndarray:
     squared second derivative. Returns an empty ``(0, n)`` matrix when there
     are too few centers to define curvature.
     """
-    n = int(n)
-    if n < 3:
-        return np.zeros((0, n), dtype=np.float64)
-    D = np.zeros((n - 2, n), dtype=np.float64)
-    for i in range(n - 2):
-        D[i, i] = 1.0
-        D[i, i + 1] = -2.0
-        D[i, i + 2] = 1.0
-    return D
+    return np.diff(np.eye(int(n)), 2, axis=0)
