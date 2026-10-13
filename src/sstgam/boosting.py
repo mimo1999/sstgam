@@ -9,7 +9,7 @@ from sklearn.model_selection import StratifiedKFold
 
 from ._training import bootstrap_bags, make_validation_split
 from .bases import basis_design, make_basis_params, second_diff_matrix_np
-from .normalization import fit_quantile_tables, robust_center_scale, static_stats
+from .normalization import fit_quantile_tables, robust_center_scale
 
 _NORMALIZATION_CLIP = 4.0
 _RIDGE = 1e-6
@@ -122,7 +122,7 @@ class SharedShapeTemporalGAMBoost:
     def normalize_static(self, column_index: int, values) -> np.ndarray:
         """Map raw values of one static covariate into ``[-clip, clip]`` with ``value_transform``.
 
-        Missing values map to the centre: the median rank or the training mean.
+        Missing values map to the centre: the median rank or the training median.
         """
         values = np.asarray(values, dtype=np.float32)
         finite = np.isfinite(values)
@@ -310,7 +310,8 @@ class SharedShapeTemporalGAMBoost:
                                                       np.isfinite(static_values)[:, :, None])
         else:
             self._feature_center, self._feature_scale = robust_center_scale(values, observed)
-            self._static_mean, self._static_scale = static_stats(static_values)
+            self._static_mean, self._static_scale = robust_center_scale(
+                static_values[:, :, None], np.isfinite(static_values)[:, :, None])
         value_span = self.clip if self.value_transform == "quantile" else 0.9 * self.clip
         self._value_basis_a, self._value_basis_b = make_basis_params(
             self.basis, -value_span, value_span, self.n_value_bases
@@ -404,24 +405,6 @@ class SharedShapeTemporalGAMBoost:
             score += np.einsum("nsp,sp->n", static_design, self._static_coefficients)
         return np.clip(expit(score), 1e-6, 1.0 - 1e-6)
 
-    def predict_proba_per_bag(self, values, observed, static_values) -> np.ndarray:
-        """Return each bag's own (unaveraged) predicted probability, shape ``(outer_bags, n_samples)``.
-
-        Exposes the bagging variance-reduction property directly: the final
-        ``predict_proba`` is the bag-averaged score passed through the
-        logistic link, not the average of these per-bag probabilities, but
-        the spread across rows here is what averaging the bags reduces.
-        """
-        temporal_design, static_design = self._build_designs(values, observed, static_values)
-        probabilities = []
-        for bag_index in range(len(self._bagged_intercepts)):
-            score = np.full(temporal_design.shape[0], self._bagged_intercepts[bag_index])
-            score += np.einsum("nfp,fp->n", temporal_design, self._bagged_temporal_coefficients[bag_index])
-            if static_design is not None:
-                score += np.einsum("nsp,sp->n", static_design, self._bagged_static_coefficients[bag_index])
-            probabilities.append(expit(score))
-        return np.clip(np.stack(probabilities, axis=0), 1e-6, 1.0 - 1e-6)
-
     def _bagged_surfaces(self, feature_index: int, value_grid, normalized_time_grid) -> np.ndarray:
         """Stack one fitted value-time surface per bag: shape (n_bags, len(value_grid), len(time_grid))."""
         value_basis = basis_design(self.basis, np.asarray(value_grid, dtype=np.float32),
@@ -442,27 +425,17 @@ class SharedShapeTemporalGAMBoost:
         ``outer_bags`` bagged fits instead of a single point estimate. With
         ``outer_bags=1`` the band collapses to the point estimate.
         """
-        if not return_interval:
-            value_basis = basis_design(self.basis, np.asarray(value_grid, dtype=np.float32),
-                                       self._value_basis_a, self._value_basis_b)
-            time_basis = basis_design(self.basis, np.asarray(normalized_time_grid, dtype=np.float32),
-                                      self._time_basis_a, self._time_basis_b)
-            coefficients = self._temporal_coefficients[feature_index].reshape(
-                self.n_value_bases, self.n_time_bases
-            )
-            return value_basis @ coefficients @ time_basis.T
-
         surfaces = self._bagged_surfaces(feature_index, value_grid, normalized_time_grid)
+        if not return_interval:
+            return surfaces.mean(axis=0)
         lower, upper = np.percentile(surfaces, [2.5, 97.5], axis=0)
         return lower, surfaces.mean(axis=0), upper
 
     def mean_value_effect_normalized(self, feature_index: int, value_grid,
                                      return_interval: bool = False):
         time_grid = np.linspace(0.0, 1.0, self.n_time_bases * 3)
-        if not return_interval:
-            surface = self.temporal_surface_normalized(feature_index, value_grid, time_grid)
-            return surface.mean(axis=1)
-
         per_bag_effect = self._bagged_surfaces(feature_index, value_grid, time_grid).mean(axis=2)
+        if not return_interval:
+            return per_bag_effect.mean(axis=0)
         lower, upper = np.percentile(per_bag_effect, [2.5, 97.5], axis=0)
         return lower, per_bag_effect.mean(axis=0), upper

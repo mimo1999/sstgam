@@ -9,7 +9,7 @@ against a known ground truth.
 
 import numpy as np
 import pandas as pd
-import pytest
+from scipy.special import expit
 
 from sstgam import SSTGAM
 
@@ -79,7 +79,7 @@ def test_bagging_reduces_prediction_variance():
     variance, the standard ``1/k`` bagging variance-reduction law.
 
     Fits once with many bags on a single dataset, then reconstructs each
-    bag's own (unaveraged) prediction via ``predict_proba_per_bag`` and
+    bag's own (unaveraged) prediction from its stored coefficients and
     resamples groups of bags to show variance shrinks as group size grows --
     isolating bagging's own effect from unrelated sources of variation (e.g.
     which rows land in a train/validation split).
@@ -99,7 +99,14 @@ def test_bagging_reduces_prediction_variance():
 
     test_X = X.iloc[:60].reset_index(drop=True)
     values, observed, static_values = model._build_tensors(model._prepare_predict_input(test_X))
-    per_bag_probability = model.model_.predict_proba_per_bag(values, observed, static_values)
+    backend = model.model_
+    temporal_design, static_design = backend._build_designs(values, observed, static_values)
+    per_bag_probability = np.stack([
+        expit(intercept + np.einsum("nfp,fp->n", temporal_design, temporal)
+              + np.einsum("nsp,sp->n", static_design, static))
+        for intercept, temporal, static in zip(backend._bagged_intercepts, backend._bagged_temporal_coefficients,
+                                               backend._bagged_static_coefficients)
+    ])
     n_bags = per_bag_probability.shape[0]
 
     def variance_for_group_size(group_size, rng, n_trials=300):

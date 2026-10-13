@@ -262,16 +262,6 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
     def predict_log_proba(self, X) -> np.ndarray:
         return np.log(np.clip(self.predict_proba(X), 1e-10, 1.0))
 
-    def get_feature_names(self) -> list[str]:
-        """Return all fitted input column names in their required order."""
-        check_is_fitted(self, "model_")
-        return list(self.feature_names_in_)
-
-    def get_temporal_features(self) -> list[str]:
-        """Return temporal feature names in model order."""
-        check_is_fitted(self, "model_")
-        return list(self.temporal_features_)
-
     def _validate_hyperparameters(self) -> None:
         if self.method not in {"spline", "tree"}:
             raise ValueError(f"method must be 'spline' or 'tree', got {self.method!r}")

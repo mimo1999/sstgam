@@ -31,7 +31,7 @@ def test_fit_predict_and_dataframe_column_alignment(longitudinal_data, method):
 
     assert np.isfinite(probability).all()
     np.testing.assert_allclose(probability, reordered_probability)
-    assert model.get_temporal_features() == ["signal"]
+    assert model.temporal_features_ == ["signal"]
 
 
 def test_interpretation_helpers(longitudinal_data):
