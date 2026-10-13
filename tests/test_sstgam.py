@@ -234,3 +234,16 @@ def test_explicit_penalty_skips_the_search(longitudinal_data):
     assert (backend.temporal_penalty_, backend.static_penalty_) == (3.0, 2.0) and not backend.penalty_search_
     with pytest.raises(ValueError, match="temporal_penalty must be 'auto' or a positive number"):
         SSTGAM(temporal_penalty="smooth").fit(X, y)
+
+
+def test_readme_quick_start_fits_tiny_data():
+    # The README example: 4 rows, so bootstrap bags can be all one class.
+    X = pd.DataFrame({
+        "signal_a_0": [0.2, 1.1, 0.5, 1.7],
+        "signal_a_6": [0.3, 0.8, None, 1.9],
+        "signal_b_0": [4.0, 2.1, 3.3, 1.4],
+        "age": [32, 51, 44, 67],
+    })
+    model = SSTGAM(method="spline", random_state=0).fit(X, [0, 0, 1, 1])
+    assert np.isfinite(model.predict_proba(X)).all()
+    assert model.static_effect("age", [30, 50, 70]).shape == (3,)

@@ -352,7 +352,9 @@ class SharedShapeTemporalGAMBoost:
         def penalty_at(temporal_strength, static_strength):
             temporal = self._penalty_matrix(self.n_value_bases, self.n_time_bases, temporal_strength)
             static = self._static_penalty(self.n_static_bases, static_strength)
-            return block_diag(np.zeros((1, 1)), *(Z.T @ temporal @ Z for Z in temporal_bases),
+            # The intercept gets the same tiny ridge as every block: without it the Hessian is
+            # singular whenever the fitted probabilities saturate (e.g. a one-class bootstrap bag).
+            return block_diag(np.full((1, 1), _RIDGE), *(Z.T @ temporal @ Z for Z in temporal_bases),
                               *(Z.T @ static @ Z for Z in static_bases))
 
         def strengths(shared):

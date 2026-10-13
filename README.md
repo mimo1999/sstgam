@@ -64,6 +64,12 @@ probability = model.predict_proba(X_train)[:, 1]
 
 ## Model
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mimo1999/sstgam/main/docs/figures/sstgam_architecture.png"
+       alt="SSTGAM architecture: each feature's measurements over 15 days pass through that feature's shared temporal shape function, and the per-feature contributions are summed into the output"
+       width="480">
+</p>
+
 For sample `i`, temporal feature `k`, time index `d`, and static feature `s`,
 the model is:
 
