@@ -1,12 +1,12 @@
-"""Shared-Shape Temporal GAM classifiers for binary longitudinal data."""
+"""Shared-Shape Temporal GAMs for longitudinal data: a binary classifier and a regressor."""
 
 from importlib.metadata import PackageNotFoundError, version
 
-from .classifier import SSTGAM
+from .classifier import SSTGAM, Explanation, SSTGAMRegressor
 
 try:
     __version__ = version("sstgam")
 except PackageNotFoundError:
     __version__ = "0.0.0"
 
-__all__ = ["SSTGAM", "__version__"]
+__all__ = ["SSTGAM", "Explanation", "SSTGAMRegressor", "__version__"]

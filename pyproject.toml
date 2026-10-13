@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "sstgam"
 version = "0.3.0"
-description = "Shared-Shape Temporal GAM for binary classification with wide longitudinal feature matrices."
+description = "Shared-Shape Temporal GAM: explainable classification and regression on wide longitudinal feature matrices."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [
@@ -20,6 +20,7 @@ keywords = [
     "time-series",
     "interpretable-machine-learning",
     "classification",
+    "regression",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

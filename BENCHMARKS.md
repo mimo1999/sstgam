@@ -6,31 +6,12 @@ that carries no licensing restriction. No benchmark implementation code,
 baseline models, or dataset-specific pipeline lives in this repository --
 `sstgam` is a standalone modeling package, not a benchmark harness.
 
-This file is a placeholder for those results. Once available, paste the
-external repo's output table below in this schema:
-
-| model | dataset | fold | auc_roc | auc_prc | brier_score |
-| --- | --- | --- | --- | --- | --- |
-| sstgam (spline) | | | | | |
-| sstgam (tree) | | | | | |
-| dl-gam | | | | | |
-| ebm | | | | | |
-| catboost | | | | | |
-
-- `model`: the fitted model name, including which SSTGAM backend (`spline`
-  or `tree`) was used.
-- `dataset`: the external benchmark dataset's name/identifier.
-- `fold`: cross-validation fold index, or `mean`/`std` summary rows across
-  folds.
-- `auc_roc`, `auc_prc`, `brier_score`: standard discrimination and
-  calibration metrics, computed identically across all models being
-  compared.
+So far there is one preliminary result, below. A cross-validated comparison
+on a genuinely longitudinal public dataset is still to come.
 
 ## Preliminary external results: IEEE-CIS fraud detection
 
-First pass from the external `sstgam_testbed` repo, on a public (unlicensed)
-dataset -- the IEEE-CIS Fraud Detection data. Not the chemo cohort (licensed,
-never used for benchmarking here). Transactions were reshaped into a wide
+First pass on a public dataset, the IEEE-CIS Fraud Detection data. Transactions were reshaped into a wide
 entity-relative-time panel (K=5 preceding transactions per entity as
 temporal history; entity proxy = `card1+card2+card3+card5+addr1+addr2`);
 every model received the identical flattened feature set. Single time-based
@@ -50,7 +31,7 @@ fraud rate.
 | sstgam (tree, tuned, K=15) | ieee_cis_fraud_wide_k15 | time_holdout | 0.813 | 0.371 | 0.027 | 259.9 |
 | gam (pygam, 40K-row subsample) | ieee_cis_fraud_wide_k5 | time_holdout | 0.749 | 0.195 | 0.031 | 37.8 |
 
-`sstgam (tree)` hyperparameters were chosen by `scripts/tune_sstgam.py`, a
+`sstgam (tree)` hyperparameters were chosen by a
 7-candidate search on a training subsample scored against the validation
 split (AUC-PRC primary, Brier secondary, fit time recorded): `learning_rate
 =0.1, max_rounds=100, early_stopping_rounds=20, n_value_bins=16,
@@ -101,7 +82,7 @@ disentangled:
 This means the calibration-vs-ranking story for SSTGAM (tree) in the earlier
 notes below is **not fully explained** by the imbalance-weighting asymmetry
 alone -- something about how this specific tuned config responds to
-weighting needs more investigation (e.g. re-running `tune_sstgam.py`'s
+weighting needs more investigation (e.g. re-running the
 search *with* weighting enabled) before treating the weighted result as a
 fair comparison point.
 
@@ -109,9 +90,7 @@ fair comparison point.
 raised that SSTGAM's value-time modeling might not be showing its real
 advantage because K=5 preceding transactions is too short a history to
 reveal genuine temporal dynamics. Tested by rebuilding the panel with K=15
-(120 temporal columns instead of 40, `scripts/prepare_data.py --k 15`,
-preserved separately in `data/prepared_k15/` alongside the original K=5
-data) and refitting SSTGAM (tree) with the same tuned hyperparameters.
+(120 temporal columns instead of 40) and refitting SSTGAM (tree) with the same tuned hyperparameters.
 Result: **no improvement** -- AUC-PRC 0.371 vs K=5's 0.374 (within noise,
 if anything marginally worse), for 66% more fit time (157.0s -> 259.9s,
 tripling the feature count roughly doubles cost). Small-subsample checks

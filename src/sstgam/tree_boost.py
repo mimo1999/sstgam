@@ -1,11 +1,15 @@
 """Histogram-based value-time GAM backend."""
 
 import numpy as np
-from scipy.special import expit
-from sklearn.metrics import log_loss
 from sklearn.tree import DecisionTreeRegressor
 
-from ._training import bootstrap_bags, make_validation_split
+from ._training import (
+    FAMILIES,
+    Family,
+    bootstrap_bags,
+    make_validation_split,
+    percentile_band,
+)
 
 _MIN_HESSIAN = 1e-6
 _N_STATIC_BINS = 16
@@ -33,33 +37,30 @@ def _quantile_edges(values: np.ndarray, n_bins: int) -> np.ndarray:
     return edges.astype(np.float64)
 
 
-
-def boost_bag(update_terms, snapshot, fit_target, fit_weight, validation_target,
+def boost_bag(family: Family, update_terms, snapshot, fit_target, fit_weight, validation_target,
               validation_weight, learning_rate: float, max_rounds: int, patience: int):
-    """Boost one bag until validation log loss stops improving for ``patience`` rounds.
+    """Boost one bag until validation loss stops improving for ``patience`` rounds.
 
-    Starts from the base-rate intercept. Each round takes a damped Newton step
+    Starts from the mean-outcome intercept. Each round takes a damped Newton step
     on the intercept, then calls ``update_terms(fit_score, validation_score)``,
     which updates the model terms and both score arrays in place. Returns
     ``(intercept, snapshot(), best_round)`` from the best validation round.
     """
-    base_rate = np.clip(np.average(fit_target, weights=fit_weight), 1e-6, 1.0 - 1e-6)
-    intercept = float(np.log(base_rate / (1.0 - base_rate)))
+    intercept = family.link(np.average(fit_target, weights=fit_weight))
     fit_score = np.full(fit_target.size, intercept)
     validation_score = np.full(validation_target.size, intercept)
 
     best_loss, best, rounds_without_improvement = np.inf, None, 0
     for round_index in range(1, max_rounds + 1):
-        probability = expit(fit_score)
-        step = learning_rate * (np.sum(fit_weight * (fit_target - probability)) /
-                                max(np.sum(fit_weight * probability * (1.0 - probability)), 1e-6))
+        mean = family.mean(fit_score)
+        step = learning_rate * (np.sum(fit_weight * (fit_target - mean)) /
+                                max(np.sum(fit_weight * family.variance(mean)), 1e-6))
         intercept += step
         fit_score += step
         validation_score += step
         update_terms(fit_score, validation_score)
 
-        loss = log_loss(validation_target, expit(validation_score),
-                        sample_weight=validation_weight, labels=[0, 1])
+        loss = np.average(family.loss(validation_score, validation_target), weights=validation_weight)
         if loss < best_loss - 1e-6:
             best_loss, best, rounds_without_improvement = loss, (intercept, snapshot(), round_index), 0
         else:
@@ -67,6 +68,7 @@ def boost_bag(update_terms, snapshot, fit_target, fit_weight, validation_target,
             if rounds_without_improvement >= patience:
                 break
     return best if best is not None else (intercept, snapshot(), 0)
+
 
 class SharedShapeTemporalGAMTreeBoost:
     """Cyclic boosted GAM with one value-bin by time-bin table per feature.
@@ -93,7 +95,9 @@ class SharedShapeTemporalGAMTreeBoost:
         early_stopping_rounds: int = 15,
         val_fraction: float = 0.15,
         random_state: int = 42,
+        family: str = "binomial",
     ) -> None:
+        self.family = family
         self.n_value_bins = n_value_bins
         self.max_depth = max_depth
         self.learning_rate = learning_rate
@@ -134,9 +138,12 @@ class SharedShapeTemporalGAMTreeBoost:
         return [self._static_column_bins(column_index, static_values[:, column_index])
                 for column_index in range(len(self._static_edges))]
 
-    def static_effect(self, column_index: int, values) -> np.ndarray:
-        """Log-odds effect of raw values of one static covariate (missing values use the median bin)."""
-        return self._static_tables[column_index][self._static_column_bins(column_index, values)]
+    def static_effect(self, column_index: int, values, return_interval: bool = False):
+        """Effect of raw values of one static covariate (missing values use the median bin)."""
+        bins = self._static_column_bins(column_index, values)
+        if not return_interval:
+            return self._static_tables[column_index][bins]
+        return percentile_band(np.stack([tables[column_index][bins] for tables in self._bagged_static_tables]))
 
     def _tree_update(self, coordinates, gradient_sum, hessian_sum, rng):
         """Plain single-stage tree update -- used for 1-D (static) terms."""
@@ -229,12 +236,10 @@ class SharedShapeTemporalGAMTreeBoost:
         hessian_sum = np.bincount(bins, weights=hessian, minlength=n_bins)
         return self._tree_update(coordinates, gradient_sum, hessian_sum, rng)
 
-    @staticmethod
-    def _grad_hess(score, target, weight):
-        probability = expit(score)
-        gradient = weight * (target - probability)
-        hessian = weight * probability * (1.0 - probability)
-        return gradient, hessian
+    def _grad_hess(self, score, target, weight):
+        family = FAMILIES[self.family]
+        mean = family.mean(score)
+        return weight * (target - mean), weight * family.variance(mean)
 
     def fit(self, values, observed, static_values, time_coordinates, target,
             sample_weight=None):
@@ -282,12 +287,12 @@ class SharedShapeTemporalGAMTreeBoost:
             for fit_indices in bootstrap_bags(train_indices, self.outer_bags, rng)
         ]
         self._bagged_feature_tables = [feature_tables for _, (feature_tables, _), _ in bags]
+        self._bagged_static_tables = [static_tables for _, (_, static_tables), _ in bags]
         self.best_rounds_ = [best_round for _, _, best_round in bags]
 
         self._intercept = float(np.mean([intercept for intercept, _, _ in bags]))
         self._feature_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_feature_tables)]
-        self._static_tables = [np.mean(tables, axis=0)
-                               for tables in zip(*(static_tables for _, (_, static_tables), _ in bags))]
+        self._static_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_static_tables)]
         return self
 
     def _fit_one_bag(self, weights, target, observed, fit_indices, validation_indices,
@@ -331,22 +336,26 @@ class SharedShapeTemporalGAMTreeBoost:
         def snapshot():
             return [table.copy() for table in feature_tables], [table.copy() for table in static_tables]
 
-        return boost_bag(update_terms, snapshot, fit_target, fit_weight,
+        return boost_bag(FAMILIES[self.family], update_terms, snapshot, fit_target, fit_weight,
                          target[validation_indices], weights[validation_indices],
                          self.learning_rate, self.max_rounds, self.early_stopping_rounds)
 
-    def predict_proba(self, values, observed, static_values):
+    def contributions(self, values, observed, static_values):
+        """Per-cell temporal ``(n, features, times)`` and per-column static ``(n, statics)`` terms.
+
+        Together with ``_intercept`` they sum to the linear predictor; missing cells contribute 0.
+        """
         values = np.asarray(values, dtype=np.float32)
         observed = np.asarray(observed, dtype=np.float64)
-        score = np.full(values.shape[0], self._intercept)
+        temporal = np.zeros(values.shape, dtype=np.float64)
         for feature_index, bins in enumerate(self._feature_bins(values)):
             cell_ids = bins * self._n_times + np.arange(self._n_times)[None, :]
-            score += (self._feature_tables[feature_index][cell_ids] *
-                      observed[:, feature_index, :]).sum(axis=1)
-        if self._static_tables:
-            for column_index, bins in enumerate(self._static_bins(static_values)):
-                score += self._static_tables[column_index][bins]
-        return np.clip(expit(score), 1e-6, 1.0 - 1e-6)
+            temporal[:, feature_index, :] = self._feature_tables[feature_index][cell_ids] * observed[:, feature_index, :]
+        static_values = np.asarray(static_values)
+        static = np.zeros(static_values.shape, dtype=np.float64)
+        for column_index, bins in enumerate(self._static_bins(static_values)):
+            static[:, column_index] = self._static_tables[column_index][bins]
+        return temporal, static
 
     def value_time_table(self, feature_index: int, return_interval: bool = False):
         """Return ``(value_bin_edges, log_odds_table)`` for one feature.
@@ -365,5 +374,4 @@ class SharedShapeTemporalGAMTreeBoost:
             bag_tables[feature_index].reshape(-1, self._n_times)
             for bag_tables in self._bagged_feature_tables
         ], axis=0)
-        lower, upper = np.percentile(tables, [2.5, 97.5], axis=0)
-        return self._value_edges[feature_index], lower, tables.mean(axis=0), upper
+        return (self._value_edges[feature_index], *percentile_band(tables))

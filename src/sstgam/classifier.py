@@ -1,91 +1,44 @@
-"""Public SSTGAM classifier."""
+"""Public SSTGAM estimators: a binary classifier and a regressor for counts or continuous outcomes."""
 
 import re
+import warnings
 from collections.abc import Iterable
+from typing import NamedTuple
 
 import numpy as np
-from sklearn.base import BaseEstimator, ClassifierMixin
+from scipy.special import expit
+from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_is_fitted
 
+from ._training import FAMILIES
 from .boosting import SharedShapeTemporalGAMBoost
 from .tree_boost import SharedShapeTemporalGAMTreeBoost
 
-_TEMPORAL_COLUMN_PATTERN = re.compile(r"^(.+)_(\d+)$")
+_TEMPORAL_COLUMN_PATTERN = re.compile(r"^(.+)_(\d+(?:\.\d+)?)$")
 
 # A point estimate, or a ``(lower, mean, upper)`` band when ``return_interval=True``.
 _Effect = np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]
 
 
-class SSTGAM(ClassifierMixin, BaseEstimator):
-    """Explainable binary classifier for wide longitudinal data.
+class Explanation(NamedTuple):
+    """Per-row additive breakdown of the linear predictor (log-odds for ``SSTGAM``).
 
-    Temporal columns use the name ``<feature_name>_<time_id>``. For example,
-    ``signal_a_0`` and ``signal_a_6`` are two observations of the same
-    feature at time coordinates 0 and 6. Columns without an integer suffix are
-    static covariates.
-
-    Each temporal feature has one shared value-time effect. The model sums the
-    effects of observed temporal cells, adds optional static feature effects,
-    and maps the result to a binary probability through a logistic link.
-    Missing temporal values are represented by an observation mask; they do
-    not contribute to the temporal surface.
-
-    Parameters
-    ----------
-    method : {"spline", "tree"}, default="spline"
-        ``"spline"`` fits smooth tensor-product value-time surfaces.
-        ``"tree"`` fits discrete value-bin by time-bin tables.
-    n_value_bases, n_time_bases, n_static_bases : int
-        Number of RBF bases used by the spline method.
-    n_value_bins, tree_depth : int
-        Value bin count and shallow-tree depth used by the tree method.
-    basis : {"rbf", "bspline"}, default="rbf"
-        Basis family used by the spline method's value-time surfaces.
-        ``"rbf"`` places fixed-bandwidth Gaussian bumps on evenly spaced
-        centers. ``"bspline"`` fits a clamped, evenly knotted B-spline basis
-        of the same size. Both use the same second-difference roughness
-        penalty, so smoothness is controlled the same way regardless of
-        basis. Ignored when ``method="tree"``.
-    value_transform : {"quantile", "zscore"}, default="quantile"
-        Per-feature value normalization for the spline method, applied to
-        temporal values and static covariates alike.
-    temporal_penalty, static_penalty : float or "auto", default="auto"
-        Smoothness penalties for spline temporal and static effects. The
-        right value depends on how much information each coefficient gets
-        and differs by orders of magnitude between datasets. With
-        ``"auto"``, terms share one penalty chosen by held-out log loss (a
-        short search from a starting guess of ~100 x coefficients per
-        minority-class example, picking the smoothest penalty within one
-        standard error of the best), then the model is refit on all rows.
-        The held-out loss comes from one ``val_fraction`` split when that
-        split holds at least 500 minority-class examples, otherwise from
-        5-fold cross-validation, which is slower but stable on small data. The chosen values are on ``model_`` as
-        ``temporal_penalty_`` / ``static_penalty_``, and every value tried
-        with its validation loss as ``penalty_search_``.
-    val_fraction : float, default=0.15
-        Held-out fraction: the tree method's early-stopping split, and the
-        spline method's ``"auto"`` penalty search.
-    learning_rate, max_rounds, early_stopping_rounds
-        Boosting controls for the tree method. The spline method has no
-        boosting rounds: it solves its penalized fit directly by P-IRLS, so
-        it ignores these.
-    outer_bags : int, default=4
-        Number of bootstrap-resampled fits (the validation split is fixed
-        across bags) whose coefficients/tables are averaged at the end --
-        the same bagging EBM uses for variance reduction. ``outer_bags=1``
-        disables bagging (a single fit on the full training split).
-    include_missingness_indicators : bool, default=False
-        When ``True``, adds one extra static covariate per temporal feature:
-        the fraction of its time points that were observed for that sample.
-        This lets the model learn from informative missingness (e.g. a
-        feature is measured more or less often depending on the outcome)
-        through the existing static-effect pathway, without asserting
-        anything about which times or features that applies to. Off by
-        default; see ``ARCHITECTURE.md`` for the missingness assumption this
-        opts out of.
-    random_state
-        Random seed (validation split, bootstrap bags, tree fitting).
+    ``intercept + temporal.sum(axis=(1, 2)) + static.sum(axis=1)`` equals
+    ``decision_function(X)``. ``temporal[i, k, t]`` is what row ``i``'s value
+    of ``temporal_features_[k]`` at ``time_ids_[t]`` adds (0 when missing);
+    ``static[i, s]`` is what ``static_features_[s]`` adds.
     """
+
+    intercept: float
+    temporal: np.ndarray
+    static: np.ndarray
+
+
+class _SSTGAMBase(BaseEstimator):
+    """Column parsing, fitting and inspection shared by ``SSTGAM`` and ``SSTGAMRegressor``."""
+
+    _family = "binomial"
 
     def __init__(
         self,
@@ -105,6 +58,7 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         early_stopping_rounds: int = 15,
         include_missingness_indicators: bool = False,
         val_fraction: float = 0.15,
+        static_columns: Iterable[str] | None = None,
         random_state: int = 42,
     ) -> None:
         self.method = method
@@ -123,22 +77,38 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         self.early_stopping_rounds = early_stopping_rounds
         self.include_missingness_indicators = include_missingness_indicators
         self.val_fraction = val_fraction
+        self.static_columns = static_columns
         self.random_state = random_state
 
-    @staticmethod
-    def _parse_columns(column_names: list[str]):
-        temporal_columns: dict[str, dict[int, int]] = {}
+    def _parse_columns(self, column_names: list[str]):
+        forced_static = set(self.static_columns or ())
+        unknown = sorted(forced_static - set(column_names))
+        if unknown:
+            raise ValueError(f"static_columns not found in X: {unknown}")
+        temporal_columns: dict[str, dict[float, int]] = {}
         static_columns: list[int] = []
         for column_index, column_name in enumerate(column_names):
-            match = _TEMPORAL_COLUMN_PATTERN.match(column_name)
+            match = None if column_name in forced_static else _TEMPORAL_COLUMN_PATTERN.match(column_name)
             if match is None:
                 static_columns.append(column_index)
                 continue
-            feature_name, time_id = match.group(1), int(match.group(2))
+            suffix = match.group(2)
+            feature_name, time_id = match.group(1), float(suffix) if "." in suffix else int(suffix)
             feature_columns = temporal_columns.setdefault(feature_name, {})
             if time_id in feature_columns:
                 raise ValueError(f"Duplicate temporal column: {column_name!r}")
             feature_columns[time_id] = column_index
+        # A lone column at a time no other feature uses is usually a static name like "icd_10".
+        for feature_name, columns in temporal_columns.items():
+            if len(columns) != 1:
+                continue
+            (time_id, column_index), = columns.items()
+            if sum(time_id in other for other in temporal_columns.values()) == 1:
+                warnings.warn(
+                    f"Column {column_names[column_index]!r} is parsed as temporal feature {feature_name!r} at "
+                    f"time {time_id}, the only column at that time. If it is static, list it in static_columns.",
+                    stacklevel=4,
+                )
         return temporal_columns, static_columns
 
     @staticmethod
@@ -146,16 +116,23 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         matrix = np.asarray(X.values if hasattr(X, "values") else X, dtype=np.float32)
         if matrix.ndim != 2:
             raise ValueError("X must be a two-dimensional matrix.")
+        if np.isinf(matrix).any():
+            raise ValueError("X contains infinite values; use NaN for missing values.")
         return matrix
 
     def _prepare_fit_input(self, X, feature_names: Iterable[str] | None):
         matrix = self._as_float_matrix(X)
-        if feature_names is None:
-            names = list(X.columns) if hasattr(X, "columns") else [
-                f"feature_{index}" for index in range(matrix.shape[1])
-            ]
-        else:
+        if feature_names is not None:
             names = list(feature_names)
+        elif hasattr(X, "columns"):
+            names = list(X.columns)
+        else:
+            # Made-up names would match the temporal pattern and silently misparse every column.
+            raise ValueError(
+                "X has no column names. Pass a DataFrame, or the names through feature_names=. "
+                "In a Pipeline, call set_output(transform='pandas') on the preceding steps."
+            )
+        names = [str(name) for name in names]
         if len(names) != matrix.shape[1]:
             raise ValueError("feature_names must contain one name per column in X.")
         if len(set(names)) != len(names):
@@ -205,13 +182,9 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
 
         return values, observed, static_values
 
-    def fit(self, X, y, feature_names: Iterable[str] | None = None, sample_weight=None) -> "SSTGAM":
-        matrix, names = self._prepare_fit_input(X, feature_names)
-        target = np.asarray(y, dtype=np.float64).ravel()
+    def _fit(self, matrix: np.ndarray, names: list[str], target: np.ndarray, sample_weight) -> None:
         if target.shape[0] != matrix.shape[0]:
             raise ValueError("X and y must contain the same number of rows.")
-        if not np.isin(target, (0.0, 1.0)).all():
-            raise ValueError("SSTGAM supports binary targets encoded as 0 and 1.")
         if sample_weight is not None:
             sample_weight = np.asarray(sample_weight, dtype=np.float64).ravel()
             if (sample_weight.shape[0] != matrix.shape[0] or np.any(sample_weight < 0)
@@ -223,6 +196,9 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         temporal_columns, static_columns = self._parse_columns(names)
         if not temporal_columns:
             raise ValueError("At least one '<feature_name>_<time_id>' column is required.")
+        empty = [name for name, column in zip(names, matrix.T) if not np.isfinite(column).any()]
+        if empty:
+            warnings.warn(f"Columns with no observed values: {empty}", stacklevel=3)
 
         self.feature_names_in_ = np.asarray(names, dtype=object)
         self.n_features_in_ = len(names)
@@ -244,23 +220,31 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
             np.asarray(self.time_ids_, dtype=np.float32), target,
             sample_weight=sample_weight,
         )
-        self.classes_ = np.array([0, 1])
-        return self
+        explanation = self._explain_matrix(matrix)
+        importances = {name: float(np.abs(explanation.temporal[:, index].sum(axis=1)).mean())
+                       for index, name in enumerate(self.temporal_features_)}
+        importances.update({name: float(np.abs(explanation.static[:, index]).mean())
+                            for index, name in enumerate(self.static_features_)})
+        self.term_importances_ = dict(sorted(importances.items(), key=lambda item: -item[1]))
 
-    def _positive_probability(self, X) -> np.ndarray:
+    def _explain_matrix(self, matrix: np.ndarray) -> Explanation:
+        temporal, static = self.model_.contributions(*self._build_tensors(matrix))
+        return Explanation(self.model_._intercept, temporal, static)
+
+    def explain(self, X) -> Explanation:
+        """Break each row's prediction into the intercept plus one term per observed cell and static column.
+
+        See ``Explanation``. Units are the link scale: log-odds for
+        ``SSTGAM``, the outcome itself for a gaussian ``SSTGAMRegressor``,
+        log-rate for a poisson one.
+        """
         check_is_fitted(self, "model_")
-        values, observed, static_values = self._build_tensors(self._prepare_predict_input(X))
-        return self.model_.predict_proba(values, observed, static_values)
+        return self._explain_matrix(self._prepare_predict_input(X))
 
-    def predict_proba(self, X) -> np.ndarray:
-        probability = self._positive_probability(X)
-        return np.column_stack((1.0 - probability, probability))
-
-    def predict(self, X) -> np.ndarray:
-        return (self._positive_probability(X) >= 0.5).astype(int)
-
-    def predict_log_proba(self, X) -> np.ndarray:
-        return np.log(np.clip(self.predict_proba(X), 1e-10, 1.0))
+    def decision_function(self, X) -> np.ndarray:
+        """Linear predictor per row (log-odds for ``SSTGAM``): the sum of ``explain(X)``."""
+        explanation = self.explain(X)
+        return explanation.intercept + explanation.temporal.sum(axis=(1, 2)) + explanation.static.sum(axis=1)
 
     def _validate_hyperparameters(self) -> None:
         if self.method not in {"spline", "tree"}:
@@ -292,6 +276,7 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
                 early_stopping_rounds=self.early_stopping_rounds,
                 val_fraction=self.val_fraction,
                 random_state=self.random_state,
+                family=self._family,
             )
         return SharedShapeTemporalGAMBoost(
             n_value_bases=self.n_value_bases,
@@ -304,7 +289,15 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
             outer_bags=self.outer_bags,
             val_fraction=self.val_fraction,
             random_state=self.random_state,
+            family=self._family,
         )
+
+    def _temporal_index(self, feature: str) -> int:
+        check_is_fitted(self, "model_")
+        if feature not in self.temporal_features_:
+            raise ValueError(f"Unknown temporal feature {feature!r}; fitted temporal features: "
+                             f"{self.temporal_features_}")
+        return self.temporal_features_.index(feature)
 
     def value_effect(self, feature: str, values, return_interval: bool = False) -> _Effect:
         """Return the fitted spline effect of values averaged across time.
@@ -316,8 +309,7 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         """
         if self.method != "spline":
             raise ValueError("value_effect is only available when method='spline'.")
-        check_is_fitted(self, "model_")
-        feature_index = self.temporal_features_.index(feature)
+        feature_index = self._temporal_index(feature)
         normalized_values = self.model_.normalize_values(feature_index, np.atleast_1d(values))
         return self.model_.mean_value_effect_normalized(
             feature_index, normalized_values, return_interval=return_interval
@@ -325,7 +317,7 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
 
     def temporal_surface(self, feature: str, values, time_coordinates,
                          return_interval: bool = False) -> _Effect:
-        """Evaluate a spline feature's value-time log-odds surface.
+        """Evaluate a spline feature's value-time surface on the link scale.
 
         With ``return_interval=True``, returns a ``(lower, mean, upper)``
         bootstrap percentile band computed across the ``outer_bags`` bagged
@@ -333,26 +325,27 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         """
         if self.method != "spline":
             raise ValueError("temporal_surface is only available when method='spline'.")
-        check_is_fitted(self, "model_")
-        feature_index = self.temporal_features_.index(feature)
+        feature_index = self._temporal_index(feature)
         normalized_values = self.model_.normalize_values(feature_index, values)
         normalized_time = self.model_.normalize_time(time_coordinates)
         return self.model_.temporal_surface_normalized(
             feature_index, normalized_values, normalized_time, return_interval=return_interval
         )
 
-    def static_effect(self, feature: str, values) -> np.ndarray:
-        """Return the fitted log-odds effect of a static covariate at ``values``.
+    def static_effect(self, feature: str, values, return_interval: bool = False) -> _Effect:
+        """Return the fitted effect of a static covariate at ``values`` on the link scale.
 
         ``feature`` is a static column name, or ``<temporal_feature>_observed_fraction``
         for a missingness indicator. Missing values get the effect the model
         uses for them at prediction time. Spline effects average zero over the
-        training rows.
+        training rows. With ``return_interval=True``, returns a
+        ``(lower, mean, upper)`` bootstrap percentile band across the bagged fits.
         """
         check_is_fitted(self, "model_")
         if feature not in self.static_features_:
             raise ValueError(f"Unknown static feature {feature!r}; fitted static features: {self.static_features_}")
-        return self.model_.static_effect(self.static_features_.index(feature), np.atleast_1d(values))
+        return self.model_.static_effect(self.static_features_.index(feature), np.atleast_1d(values),
+                                         return_interval=return_interval)
 
     def value_time_table(self, feature: str, return_interval: bool = False) -> tuple[np.ndarray, ...]:
         """Return the tree backend's fitted value-bin by time-bin table.
@@ -364,7 +357,176 @@ class SSTGAM(ClassifierMixin, BaseEstimator):
         """
         if self.method != "tree":
             raise ValueError("value_time_table is only available when method='tree'.")
-        check_is_fitted(self, "model_")
-        return self.model_.value_time_table(
-            self.temporal_features_.index(feature), return_interval=return_interval
+        return self.model_.value_time_table(self._temporal_index(feature), return_interval=return_interval)
+
+
+class SSTGAM(ClassifierMixin, _SSTGAMBase):
+    """Explainable binary classifier for wide longitudinal data.
+
+    Temporal columns use the name ``<feature_name>_<time_id>``. For example,
+    ``signal_a_0`` and ``signal_a_6`` are two observations of the same
+    feature at time coordinates 0 and 6; time ids may also be decimals
+    (``signal_a_0.5``). Columns without a numeric suffix, and columns listed
+    in ``static_columns``, are static covariates.
+
+    Each temporal feature has one shared value-time effect. The model sums the
+    effects of observed temporal cells, adds optional static feature effects,
+    and maps the result to a binary probability through a logistic link.
+    Missing temporal values are represented by an observation mask; they do
+    not contribute to the temporal surface.
+
+    Parameters
+    ----------
+    method : {"spline", "tree"}, default="spline"
+        ``"spline"`` fits smooth tensor-product value-time surfaces.
+        ``"tree"`` fits discrete value-bin by time-bin tables.
+    n_value_bases, n_time_bases, n_static_bases : int
+        Number of RBF bases used by the spline method.
+    n_value_bins, tree_depth : int
+        Value bin count and shallow-tree depth used by the tree method.
+    basis : {"rbf", "bspline"}, default="rbf"
+        Basis family used by the spline method's value-time surfaces.
+        ``"rbf"`` places fixed-bandwidth Gaussian bumps on evenly spaced
+        centers. ``"bspline"`` fits a clamped, evenly knotted B-spline basis
+        of the same size. Both use the same second-difference roughness
+        penalty, so smoothness is controlled the same way regardless of
+        basis. Ignored when ``method="tree"``.
+    value_transform : {"quantile", "zscore"}, default="quantile"
+        Per-feature value normalization for the spline method, applied to
+        temporal values and static covariates alike.
+    temporal_penalty, static_penalty : float or "auto", default="auto"
+        Smoothness penalties for spline temporal and static effects. The
+        right value depends on how much information each coefficient gets
+        and differs by orders of magnitude between datasets. With
+        ``"auto"``, terms share one penalty chosen by held-out loss (a
+        short search from a starting guess of ~100 x coefficients per
+        minority-class example, picking the smoothest penalty within one
+        standard error of the best), then the model is refit on all rows.
+        The held-out loss comes from one ``val_fraction`` split when that
+        split holds at least 500 minority-class examples, otherwise from
+        5-fold cross-validation, which is slower but stable on small data. The chosen values are on ``model_`` as
+        ``temporal_penalty_`` / ``static_penalty_``, and every value tried
+        with its validation loss as ``penalty_search_``.
+    val_fraction : float, default=0.15
+        Held-out fraction: the tree method's early-stopping split, and the
+        spline method's ``"auto"`` penalty search.
+    learning_rate, max_rounds, early_stopping_rounds
+        Boosting controls for the tree method. The spline method has no
+        boosting rounds: it solves its penalized fit directly by P-IRLS, so
+        it ignores these.
+    outer_bags : int, default=4
+        Number of bootstrap-resampled fits (the validation split is fixed
+        across bags) whose coefficients/tables are averaged at the end --
+        the same bagging EBM uses for variance reduction. ``outer_bags=1``
+        disables bagging (a single fit on the full training split). The
+        ``return_interval`` bands are percentiles across these fits, so use
+        20 or more when the bands matter.
+    include_missingness_indicators : bool, default=False
+        When ``True``, adds one extra static covariate per temporal feature:
+        the fraction of its time points that were observed for that sample.
+        This lets the model learn from informative missingness (e.g. a
+        feature is measured more or less often depending on the outcome)
+        through the existing static-effect pathway, without asserting
+        anything about which times or features that applies to. Off by
+        default; see ``ARCHITECTURE.md`` for the missingness assumption this
+        opts out of.
+    static_columns : list of str, optional
+        Column names to treat as static even though they end in ``_<number>``
+        (e.g. ``icd_10``).
+    random_state
+        Random seed (validation split, bootstrap bags, tree fitting).
+
+    Attributes
+    ----------
+    classes_ : ndarray of shape (2,)
+        The two labels; probabilities and effects refer to ``classes_[1]``.
+    temporal_features_, static_features_, time_ids_
+        Parsed feature names and the sorted time ids.
+    term_importances_ : dict
+        Mean absolute log-odds contribution of each term over the training
+        rows, largest first (the temporal terms summed over time per row).
+    """
+
+    def fit(self, X, y, feature_names: Iterable[str] | None = None, sample_weight=None) -> "SSTGAM":
+        matrix, names = self._prepare_fit_input(X, feature_names)
+        labels = np.asarray(y).ravel()
+        check_classification_targets(labels)
+        classes = np.unique(labels)
+        if len(classes) != 2:
+            raise ValueError(f"SSTGAM needs a binary target with exactly two classes; y has {len(classes)}: "
+                             f"{classes[:5].tolist()}")
+        self.classes_ = classes
+        self._fit(matrix, names, (labels == classes[1]).astype(np.float64), sample_weight)
+        return self
+
+    def predict_proba(self, X) -> np.ndarray:
+        probability = np.clip(expit(self.decision_function(X)), 1e-6, 1.0 - 1e-6)
+        return np.column_stack((1.0 - probability, probability))
+
+    def predict(self, X) -> np.ndarray:
+        return self.classes_[(self.decision_function(X) >= 0.0).astype(int)]
+
+    def predict_log_proba(self, X) -> np.ndarray:
+        return np.log(np.clip(self.predict_proba(X), 1e-10, 1.0))
+
+
+class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
+    """SSTGAM for a continuous (``family="gaussian"``) or count (``family="poisson"``) outcome.
+
+    Same model, data format and parameters as ``SSTGAM``; only the link
+    changes. Gaussian uses the identity link, so effects are in the outcome's
+    units; poisson uses the log link, so effects are log-rate and combine
+    multiplicatively on the rate. ``predict`` returns the expected outcome.
+    """
+
+    def __init__(
+        self,
+        family: str = "gaussian",
+        method: str = "spline",
+        n_value_bases: int = 8,
+        n_time_bases: int = 5,
+        n_static_bases: int = 8,
+        n_value_bins: int = 16,
+        tree_depth: int = 3,
+        basis: str = "rbf",
+        value_transform: str = "quantile",
+        temporal_penalty: float | str = "auto",
+        static_penalty: float | str = "auto",
+        learning_rate: float = 0.02,
+        max_rounds: int = 100,
+        outer_bags: int = 4,
+        early_stopping_rounds: int = 15,
+        include_missingness_indicators: bool = False,
+        val_fraction: float = 0.15,
+        static_columns: Iterable[str] | None = None,
+        random_state: int = 42,
+    ) -> None:
+        super().__init__(
+            method=method, n_value_bases=n_value_bases, n_time_bases=n_time_bases,
+            n_static_bases=n_static_bases, n_value_bins=n_value_bins, tree_depth=tree_depth, basis=basis,
+            value_transform=value_transform, temporal_penalty=temporal_penalty, static_penalty=static_penalty,
+            learning_rate=learning_rate, max_rounds=max_rounds, outer_bags=outer_bags,
+            early_stopping_rounds=early_stopping_rounds,
+            include_missingness_indicators=include_missingness_indicators, val_fraction=val_fraction,
+            static_columns=static_columns, random_state=random_state,
         )
+        self.family = family
+
+    @property
+    def _family(self) -> str:  # type: ignore[override]
+        return self.family
+
+    def fit(self, X, y, feature_names: Iterable[str] | None = None, sample_weight=None) -> "SSTGAMRegressor":
+        if self.family not in {"gaussian", "poisson"}:
+            raise ValueError(f"family must be 'gaussian' or 'poisson', got {self.family!r}")
+        matrix, names = self._prepare_fit_input(X, feature_names)
+        target = np.asarray(y, dtype=np.float64).ravel()
+        if not np.isfinite(target).all():
+            raise ValueError("y must be finite.")
+        if self.family == "poisson" and (target < 0).any():
+            raise ValueError("family='poisson' needs a non-negative target.")
+        self._fit(matrix, names, target, sample_weight)
+        return self
+
+    def predict(self, X) -> np.ndarray:
+        return FAMILIES[self.family].mean(self.decision_function(X))

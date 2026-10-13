@@ -1,9 +1,32 @@
 # SSTGAM
 
-SSTGAM is a small, standalone Python package for explainable binary
-classification with multiple time-varying features. It fits one shared
+SSTGAM is a small, standalone Python package for explainable models of
+outcomes driven by multiple time-varying features: binary classification
+(`SSTGAM`), and continuous or count outcomes (`SSTGAMRegressor`). It fits one shared
 value-time effect per feature, so the effect of a value can change smoothly or
 discretely over time while remaining directly inspectable.
+
+## Why not EBM or pyGAM?
+
+Give EBM or pyGAM a lab measured on 15 days and it sees 15 unrelated columns:
+each day gets its own shape function, learned only from that day's
+measurements. Day 7 learns nothing from days 6 and 8, so the curves come out
+noisy and jump from day to day, and nothing ties them into one story about the
+lab. SSTGAM fits a single value-by-time surface per feature from every
+observed day at once. Neighbouring days share strength, the effect can still
+drift over time, and the whole feature is explained by one picture.
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mimo1999/sstgam/main/docs/figures/fig1_what_each_model_learns.png"
+       alt="Synthetic lab over 15 days: the true value-by-day effect, SSTGAM spline's smooth surface, SSTGAM tree's value-bin by day table, and EBM's 15 noisy per-day functions, with day 1, 8 and 15 cross-sections"
+       width="900">
+</p>
+
+On synthetic data with a known effect (monotone early, U-shaped late), the
+spline surface tracks the truth; EBM's per-day functions are noisier,
+especially on late days and at extreme values where each day has few
+observations. Scripts for all figures are in
+[docs/figures](https://github.com/mimo1999/sstgam/tree/main/docs/figures).
 
 See [ARCHITECTURE.md](https://github.com/mimo1999/sstgam/blob/main/ARCHITECTURE.md) for the model design and its
 stated assumptions/limits, and [BENCHMARKS.md](https://github.com/mimo1999/sstgam/blob/main/BENCHMARKS.md) for
@@ -21,14 +44,21 @@ use pandas, which is optional (`pip install pandas`).
 ## Data format
 
 `SSTGAM` accepts a wide matrix. Name each temporal column
-`<feature_name>_<time_id>`, where `time_id` is a non-negative integer. All
-other columns are treated as static covariates.
+`<feature_name>_<time_id>`, where `time_id` is a non-negative number such as
+`6` or `0.5`. Time ids are placed at their actual distances, so uneven
+spacing (days 0, 3, 7, 14) is fine; every row shares the same set of time
+columns. All other columns are treated as static covariates.
 
 When fitting a NumPy array instead of a DataFrame, pass the matching column
-names explicitly through `feature_names`. Inside a scikit-learn `Pipeline` or
-`GridSearchCV`, column names are only preserved if every preceding step
-outputs DataFrames, e.g. `preprocessor.set_output(transform="pandas")`;
-otherwise `fit` sees no temporal columns and raises an error.
+names explicitly through `feature_names`; without names `fit` raises an error.
+Inside a scikit-learn `Pipeline` or `GridSearchCV`, column names are only
+preserved if every preceding step outputs DataFrames, e.g.
+`preprocessor.set_output(transform="pandas")`.
+
+A static column whose name happens to end in `_<number>` (e.g. `icd_10`)
+would be read as a temporal feature; list it in `static_columns=["icd_10"]`.
+`fit` warns when a lone column like this sits at a time no other feature
+uses. Static covariates must be numeric: encode categories before fitting.
 
 For example:
 
@@ -39,8 +69,8 @@ For example:
 | `signal_b_0` | `signal_b` at time 0 |
 | `age` | static covariate |
 
-Missing temporal values may be represented by `NaN`. They make no temporal
-contribution. Input DataFrames are aligned to the fitted column names at
+Missing values are `NaN` (infinite values raise an error). Missing temporal
+values make no temporal contribution. Input DataFrames are aligned to the fitted column names at
 prediction time; missing or unexpected columns raise an error.
 
 ## Quick start
@@ -55,11 +85,73 @@ X_train = pd.DataFrame({
     "signal_b_0": [4.0, 2.1, 3.3, 1.4],
     "age": [32, 51, 44, 67],
 })
-y_train = [0, 0, 1, 1]
+y_train = [0, 0, 1, 1]  # any two labels, e.g. ["no", "no", "yes", "yes"]
 
 model = SSTGAM(method="spline", random_state=0)
 model.fit(X_train, y_train)
 probability = model.predict_proba(X_train)[:, 1]
+```
+
+For a continuous or count outcome, use `SSTGAMRegressor` with the same data
+format and parameters; `predict` returns the expected outcome:
+
+```python
+from sstgam import SSTGAMRegressor
+
+regressor = SSTGAMRegressor(family="poisson")  # or "gaussian" (the default)
+regressor.fit(X_train, [0, 2, 1, 5])
+expected_count = regressor.predict(X_train)
+```
+
+## Interpreting outputs
+
+Every effect is on the model's link scale: **log-odds** of the second class
+in `model.classes_` for `SSTGAM`, the outcome's own units for a gaussian
+`SSTGAMRegressor`, and log-rate for a poisson one. Effects are centred:
+spline effects average zero over the training data, so positive means
+"raises the outcome relative to a typical observation".
+
+| Method | Backend | Returns |
+| --- | --- | --- |
+| `temporal_surface(feature, values, time_coordinates)` | spline | array `(len(values), len(time_coordinates))`: the effect one observation at that value and time adds |
+| `value_effect(feature, values)` | spline | array `(len(values),)`: the surface averaged over time |
+| `value_time_table(feature)` | tree | `(value_bin_edges, table)`, table `(n_bins, len(model.time_ids_))`, edges in raw units |
+| `static_effect(feature, values)` | both | array `(len(values),)` for a static covariate |
+| `explain(X)` | both | `Explanation(intercept, temporal, static)`: per-row terms, `temporal` `(n_rows, len(model.temporal_features_), len(model.time_ids_))`, `static` `(n_rows, len(model.static_features_))` |
+| `decision_function(X)` | both | array `(n_rows,)`: the link-scale prediction, the sum of `explain(X)` |
+| `term_importances_` | both | dict of each term's mean absolute contribution over the training rows, largest first |
+
+`temporal_surface`, `value_effect`, `static_effect` and `value_time_table` take
+`return_interval=True` and then return `(lower, mean, upper)`: the 2.5 and
+97.5 percentiles across the `outer_bags` bootstrap fits. With the default 4
+bags this is a rough stability check, not a calibrated interval; raise
+`outer_bags` (e.g. 20) when the bands matter. Time coordinates are the ids
+from the column names; outside the range seen in training the surface is
+extrapolated and unreliable.
+
+A patient's score is the sum of what each observed cell adds, so a prediction
+can be explained day by day. `explain(X)` returns exactly these per-day
+terms; missing days are 0:
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/mimo1999/sstgam/main/docs/figures/fig4_scoring_one_patient.png"
+       alt="One patient's lab values over 15 days and the log-odds each model adds per day; SSTGAM adds zero for missing days, EBM scores them too"
+       width="700">
+</p>
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+values = np.linspace(X_train["signal_a_0"].min(), X_train["signal_a_0"].max(), 50)
+times = model.time_ids_
+surface = model.temporal_surface("signal_a", values, times)
+plt.pcolormesh(times, values, surface, cmap="RdBu_r", shading="nearest")
+plt.xlabel("time"); plt.ylabel("signal_a"); plt.colorbar(label="log-odds")
+
+explanation = model.explain(X_train)
+row = 0  # what each observed time of signal_a adds for the first row
+dict(zip(model.time_ids_, explanation.temporal[row, model.temporal_features_.index("signal_a")]))
 ```
 
 ## Model
@@ -84,60 +176,27 @@ one-dimensional static effect. This is an additive time-varying model: it
 does not directly model lags, slopes, or interactions between successive
 measurements. Supply those as input features if they are needed.
 
-The spline method is a penalized GAM solved directly by P-IRLS: a handful of
-full penalized Newton steps over all coefficients at once (typically under
-20), on all training rows, with no boosting rounds or validation split.
-`temporal_penalty`/`static_penalty` set the smoothness. Every spline term is
-centred (a surface averages zero over the observed training cells, a static
-effect over the training rows), so effect levels are comparable and the
-overall level sits in the intercept. The tree method is fitted by cyclic
-Newton boosting with shallow trees and early stopping on validation log loss
-(see [ARCHITECTURE.md](https://github.com/mimo1999/sstgam/blob/main/ARCHITECTURE.md)). Both methods are bagged: `outer_bags`
-independent fits are run on bootstrap resamples of the training rows and
-their fitted parameters are averaged. Averaging leaves the
-model in the same form — a mean of coefficient vectors over a shared basis is
-another coefficient vector, and a mean of value-time tables is another table —
-so bagging reduces variance without changing what `f_k` is.
+The spline method is a penalized GAM solved directly by P-IRLS, with the
+smoothness penalty chosen on held-out data. The tree method is fitted by
+cyclic Newton boosting with shallow trees and early stopping. Both average
+`outer_bags` bootstrap fits, which leaves the model in the same form. See
+[ARCHITECTURE.md](https://github.com/mimo1999/sstgam/blob/main/ARCHITECTURE.md)
+for the fitting details.
 
 ## Methods
 
 - `method="spline"` (default) uses smooth tensor-product surfaces with
-  roughness penalties. Use this when you want smooth effect plots and support
-  for irregular numeric time coordinates. Set `basis="rbf"` (default) for
+  roughness penalties. Use this when you want smooth effect plots; unevenly
+  spaced time ids (e.g. days 0, 3, 7, 14) are placed at their actual
+  distances. Set `basis="rbf"` (default) for
   fixed-bandwidth Gaussian bumps or `basis="bspline"` for a clamped B-spline
   basis of the same size; both use the same roughness penalty.
 - `method="tree"` uses quantile value bins and shallow tree updates to learn a
   discrete value-time table. Use `value_time_table(feature)` to inspect it.
 
-Each tree update chooses its split order adaptively rather than letting the
-tree pick freely. Depth-1 candidate splits are fitted on the value axis and the
-time axis separately and scored by weighted-SSE gain minus `2 * log(m)`, where
-`m` is the number of distinct candidate thresholds on that axis; the
-higher-scoring axis splits first and the other refines within each resulting
-group. This is a candidate-count penalty on greedy SSE gain, not a formal
-Bonferroni or BIC correction (there is no p-value or likelihood term here) —
-just the same intuition: an axis with more candidate thresholds gets more
-chances for a greedy split to look good by chance, so the penalty scales with
-the log of the candidate count. Without it the value axis wins on candidate
-count alone, since it usually has more quantile bins than there are
-observation times.
-
-For spline models, inspect fitted effects with:
-
-```python
-value_effect = model.value_effect("signal_a", values=[0.0, 0.5, 1.0])
-surface = model.temporal_surface(
-    "signal_a", values=[0.0, 0.5, 1.0], time_coordinates=[0, 3, 6]
-)
-```
-
-Static covariates (and, with `include_missingness_indicators=True`, the
-`<feature>_observed_fraction` indicators) are inspectable with either method:
-
-```python
-age_effect = model.static_effect("age", values=[30, 50, 70])
-model.static_features_  # names accepted by static_effect
-```
+With `include_missingness_indicators=True`, `static_effect` also accepts
+`<feature>_observed_fraction`; `model.static_features_` lists every name it
+accepts.
 
 ## Key parameters
 
@@ -145,9 +204,10 @@ model.static_features_  # names accepted by static_effect
   complexity and smoothness. `n_static_bases`, `static_penalty`: the same for
   static effects. The penalties default to `"auto"`: the right value differs
   by orders of magnitude between datasets (it tracks how many minority-class
-  examples each coefficient has), so it is chosen by held-out log loss --
-  one validation split on large data, 5-fold cross-validation when there
-  are under ~500 held-out minority examples. Pass numbers to fix them.
+  examples each coefficient has), so it is chosen by held-out loss -- one
+  validation split on large data, 5-fold cross-validation when there are
+  under ~500 held-out minority examples (rows, for `SSTGAMRegressor`). Pass
+  numbers to fix them.
 - `n_value_bins`, `tree_depth`: tree table resolution and update complexity.
 - `learning_rate`, `max_rounds`, `early_stopping_rounds`: boosting controls
   for the tree method; the spline method ignores them. `val_fraction`: the

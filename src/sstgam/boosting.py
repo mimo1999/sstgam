@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 from scipy.linalg import block_diag
-from scipy.special import expit
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import KFold, StratifiedKFold
 
-from ._training import bootstrap_bags, make_validation_split
+from ._training import FAMILIES, bootstrap_bags, make_validation_split, percentile_band
 from .bases import basis_design, make_basis_params, second_diff_matrix_np
 from .normalization import fit_quantile_tables, robust_center_scale
 
@@ -39,7 +38,8 @@ def _row_chunks(n_rows: int):
 class SharedShapeTemporalGAMBoost:
     """Penalized GAM over smooth value-time feature surfaces, fitted by P-IRLS.
 
-    The fit maximises ``sum_i w_i loglik_i - 1/2 beta' P beta`` jointly over
+    ``family`` is ``"binomial"`` (logit link), ``"gaussian"`` (identity) or
+    ``"poisson"`` (log). The fit maximises ``sum_i w_i loglik_i - 1/2 beta' P beta`` jointly over
     the intercept and every surface and static coefficient block, with full
     penalized Newton steps (step-halved so each one improves the objective)
     until the objective stops changing. The model has few coefficients, so
@@ -51,7 +51,7 @@ class SharedShapeTemporalGAMBoost:
     as an average observed one.
 
     ``temporal_penalty``/``static_penalty`` set to ``"auto"`` share one
-    penalty chosen by held-out log loss (``_select_penalty``).
+    penalty chosen by held-out loss (``_select_penalty``).
 
     ``outer_bags`` bootstrap fits are averaged at the end, as in EBM.
     """
@@ -68,7 +68,9 @@ class SharedShapeTemporalGAMBoost:
         outer_bags: int = 4,
         val_fraction: float = 0.15,
         random_state: int = 42,
+        family: str = "binomial",
     ) -> None:
+        self.family = family
         self.n_value_bases = n_value_bases
         self.n_time_bases = n_time_bases
         self.n_static_bases = n_static_bases
@@ -134,11 +136,14 @@ class SharedShapeTemporalGAMBoost:
             normalized = (np.where(finite, values, mean) - mean) / scale
         return np.clip(normalized, -self.clip, self.clip).astype(np.float32)
 
-    def static_effect(self, column_index: int, values) -> np.ndarray:
-        """Log-odds effect of raw values of one static covariate."""
+    def static_effect(self, column_index: int, values, return_interval: bool = False):
+        """Effect of raw values of one static covariate on the linear predictor."""
         static_basis = basis_design(self.basis, self.normalize_static(column_index, values),
                                     self._static_basis_a, self._static_basis_b)
-        return static_basis @ self._static_coefficients[column_index]
+        if not return_interval:
+            return static_basis @ self._static_coefficients[column_index]
+        return percentile_band(np.stack([static_basis @ bag[column_index]
+                                         for bag in self._bagged_static_coefficients]))
 
     def _build_designs(self, values, observed, static_values):
         values = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0)
@@ -166,36 +171,35 @@ class SharedShapeTemporalGAMBoost:
         ], axis=1)
         return temporal_design, static_design
 
-    @staticmethod
-    def _penalized_newton(design, target, sample_weight, penalty, initial=None):
-        """Maximise the penalized weighted log-likelihood of a logistic model by P-IRLS.
+    def _penalized_newton(self, design, target, sample_weight, penalty, initial=None):
+        """Maximise the penalized weighted log-likelihood of ``family`` by P-IRLS.
 
         ``design`` is ``(n, p)`` with an intercept column first. Starts from
-        ``initial`` if given (a warm start), else from the base-rate intercept.
+        ``initial`` if given (a warm start), else from the mean-outcome intercept.
         Returns the coefficients and the number of Newton iterations taken.
         """
+        family = FAMILIES[self.family]
         n_rows = design.shape[0]
         if initial is not None:
             beta = np.array(initial, dtype=np.float64)
         else:
-            base_rate = np.clip(np.average(target, weights=sample_weight), 1e-6, 1.0 - 1e-6)
             beta = np.zeros(design.shape[1])
-            beta[0] = np.log(base_rate / (1.0 - base_rate))
+            beta[0] = family.link(np.average(target, weights=sample_weight))
 
         def linear_predictor(coefficients):
             return np.concatenate([design[rows].astype(np.float64) @ coefficients
                                    for rows in _row_chunks(n_rows)])
 
         def objective(eta, coefficients):
-            negative_loglik = np.sum(sample_weight * (np.logaddexp(0.0, eta) - target * eta))
+            negative_loglik = np.sum(sample_weight * family.loss(eta, target))
             return negative_loglik + 0.5 * coefficients @ penalty @ coefficients
 
         eta = linear_predictor(beta)
         current = objective(eta, beta)
         for iteration in range(1, _MAX_NEWTON_ITERATIONS + 1):
-            probability = expit(eta)
-            residual = sample_weight * (target - probability)
-            curvature = sample_weight * probability * (1.0 - probability)
+            mean = family.mean(eta)
+            residual = sample_weight * (target - mean)
+            curvature = sample_weight * family.variance(mean)
             gradient, hessian = -penalty @ beta, penalty.copy()
             for rows in _row_chunks(n_rows):
                 chunk = design[rows].astype(np.float64)
@@ -218,11 +222,12 @@ class SharedShapeTemporalGAMBoost:
         return beta, iteration
 
     def _select_penalty(self, design, target, sample_weight, penalty_for):
-        """Choose the shared ``"auto"`` penalty by held-out weighted log loss.
+        """Choose the shared ``"auto"`` penalty by held-out weighted loss (deviance).
 
-        Scores a stratified ``val_fraction`` split when it would hold at least
-        ``_AUTO_PENALTY_MIN_HELDOUT_EVENTS`` minority-class examples, else the
-        out-of-fold rows of a stratified ``_AUTO_PENALTY_CV_FOLDS``-fold split.
+        Scores a ``val_fraction`` split when it would hold at least
+        ``_AUTO_PENALTY_MIN_HELDOUT_EVENTS`` minority-class examples (rows, for
+        a non-binomial family), else the out-of-fold rows of a
+        ``_AUTO_PENALTY_CV_FOLDS``-fold split, stratified for binomial.
         Starts at ~100 x coefficients per minority-class example, tries
         that value and one ``sqrt(10)`` step either side, then steps outward
         by 10x while the edge value is clearly better than its neighbour --
@@ -233,13 +238,16 @@ class SharedShapeTemporalGAMBoost:
         already done. Returns the chosen penalty and its coefficients (a warm
         start for the final fit).
         """
+        family = FAMILIES[self.family]
+        binomial = self.family == "binomial"
         positives = target.sum()
-        minority = max(min(positives, target.size - positives), 1.0)
+        # ponytail: for gaussian/poisson every row counts as one "event"; fine as a starting guess.
+        minority = max(min(positives, target.size - positives), 1.0) if binomial else float(target.size)
         n_folds = int(min(_AUTO_PENALTY_CV_FOLDS, minority))
         if minority * self.val_fraction >= _AUTO_PENALTY_MIN_HELDOUT_EVENTS or n_folds < 2:
             splits = [make_validation_split(target, self.val_fraction, self.random_state)]
         else:
-            folds = StratifiedKFold(n_folds, shuffle=True, random_state=self.random_state)
+            folds = (StratifiedKFold if binomial else KFold)(n_folds, shuffle=True, random_state=self.random_state)
             splits = list(folds.split(np.zeros((target.size, 1)), target))
         held_out = [(validation, design[validation]) for _, validation in splits]
         held_out_target = np.concatenate([target[validation] for validation, _ in held_out])
@@ -262,7 +270,7 @@ class SharedShapeTemporalGAMBoost:
                             for rows in _row_chunks(validation.size))
                 betas.append(beta)
             eta = np.concatenate(etas)
-            row_losses = held_out_weight * (np.logaddexp(0.0, eta) - held_out_target * eta)
+            row_losses = held_out_weight * family.loss(eta, held_out_target)
             fits[strength] = (float(row_losses.sum() / total_weight), betas, row_losses)
 
         def loss(strength):
@@ -397,13 +405,25 @@ class SharedShapeTemporalGAMBoost:
                                      else np.mean(self._bagged_static_coefficients, axis=0))
         return self
 
-    def predict_proba(self, values, observed, static_values):
-        temporal_design, static_design = self._build_designs(values, observed, static_values)
-        score = np.full(temporal_design.shape[0], self._intercept)
-        score += np.einsum("nfp,fp->n", temporal_design, self._temporal_coefficients)
-        if static_design is not None:
-            score += np.einsum("nsp,sp->n", static_design, self._static_coefficients)
-        return np.clip(expit(score), 1e-6, 1.0 - 1e-6)
+    def contributions(self, values, observed, static_values):
+        """Per-cell temporal ``(n, features, times)`` and per-column static ``(n, statics)`` terms.
+
+        Together with ``_intercept`` they sum to the linear predictor; missing cells contribute 0.
+        """
+        values = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0)
+        observed = np.asarray(observed, dtype=np.float32)
+        temporal = np.empty(values.shape, dtype=np.float64)
+        for feature_index in range(values.shape[1]):
+            value_basis = basis_design(self.basis, self.normalize_values(feature_index, values[:, feature_index, :]),
+                                       self._value_basis_a, self._value_basis_b)
+            coefficients = self._temporal_coefficients[feature_index].reshape(self.n_value_bases, self.n_time_bases)
+            temporal[:, feature_index, :] = ((value_basis @ coefficients) * self._time_basis).sum(axis=2)
+        temporal *= observed
+        static_values = np.asarray(static_values, dtype=np.float32)
+        static = np.zeros(static_values.shape, dtype=np.float64)
+        for column_index in range(static_values.shape[1]):
+            static[:, column_index] = self.static_effect(column_index, static_values[:, column_index])
+        return temporal, static
 
     def _bagged_surfaces(self, feature_index: int, value_grid, normalized_time_grid) -> np.ndarray:
         """Stack one fitted value-time surface per bag: shape (n_bags, len(value_grid), len(time_grid))."""
@@ -426,16 +446,10 @@ class SharedShapeTemporalGAMBoost:
         ``outer_bags=1`` the band collapses to the point estimate.
         """
         surfaces = self._bagged_surfaces(feature_index, value_grid, normalized_time_grid)
-        if not return_interval:
-            return surfaces.mean(axis=0)
-        lower, upper = np.percentile(surfaces, [2.5, 97.5], axis=0)
-        return lower, surfaces.mean(axis=0), upper
+        return percentile_band(surfaces) if return_interval else surfaces.mean(axis=0)
 
     def mean_value_effect_normalized(self, feature_index: int, value_grid,
                                      return_interval: bool = False):
         time_grid = np.linspace(0.0, 1.0, self.n_time_bases * 3)
         per_bag_effect = self._bagged_surfaces(feature_index, value_grid, time_grid).mean(axis=2)
-        if not return_interval:
-            return per_bag_effect.mean(axis=0)
-        lower, upper = np.percentile(per_bag_effect, [2.5, 97.5], axis=0)
-        return lower, per_bag_effect.mean(axis=0), upper
+        return percentile_band(per_bag_effect) if return_interval else per_bag_effect.mean(axis=0)

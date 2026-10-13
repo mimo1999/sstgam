@@ -1,8 +1,14 @@
 # SSTGAM architecture
 
-SSTGAM is an additive binary classifier for wide longitudinal data. It keeps a
-single effect surface for each temporal feature and evaluates that surface at
-every observed time point.
+SSTGAM is an additive model for wide longitudinal data. It keeps a single
+effect surface for each temporal feature and evaluates that surface at every
+observed time point. `SSTGAM` is the binary classifier (logit link);
+`SSTGAMRegressor` fits the same model with an identity link (`family="gaussian"`)
+or a log link (`family="poisson"`). Each family is canonical, so both fitting
+methods only swap the mean, variance and per-row loss (`_training.FAMILIES`):
+the gradient is always `y - mean` and the curvature the family's variance.
+Everything below is written for the logit link and holds for the others with
+"log-odds" read as "linear predictor".
 
 ## Input representation
 
@@ -14,7 +20,9 @@ observed[sample, feature, time]
 ```
 
 The observation mask is one for finite input values and zero for missing
-values. Columns without a trailing integer are static covariates.
+values. Columns without a trailing number (`_6`, `_0.5`) are static
+covariates, as are any listed in `static_columns`. Time ids are mapped
+linearly onto the time axis, so uneven spacing keeps its real distances.
 
 ## Statistical model
 
@@ -58,7 +66,7 @@ penalized GAM: all terms share one design matrix (intercept, every surface
 block, every static block), and each iteration takes a full Newton step with
 gradient `X' w (y - p) - P beta` and Hessian `X' diag(w p (1 - p)) X + P`,
 halving the step if it would not improve the objective. The model has few
-coefficients (161 on the 8-feature IEEE benchmark), so each iteration is one
+coefficients (hundreds, not thousands, on the IEEE benchmark), so each iteration is one
 small dense solve, and it converges in under 20 iterations. The Hessian is
 accumulated over row chunks to bound memory.
 
@@ -67,7 +75,7 @@ accumulated over row chunks to bound memory.
 Because the fit is the exact penalized optimum, the penalty alone sets the
 smoothness, and its right value varies by orders of magnitude between
 datasets: roughly with the number of coefficients per minority-class
-example: 0.01-0.1 on the 14k-event fraud benchmark with ~350 coefficients,
+example: 0.01-0.1 on the 14k-event fraud benchmark with a few hundred coefficients,
 but in the thousands for a small, wide dataset with a few hundred events and
 thousands of coefficients. No fixed default
 serves both, so `temporal_penalty`/`static_penalty` default to `"auto"`
@@ -160,7 +168,12 @@ variance-reduction step only. Set `outer_bags=1` to disable it.
 
 Spline models expose `value_effect` and `temporal_surface`. Tree models expose
 `value_time_table`. Both expose `static_effect` for static covariates and
-missingness indicators. Each output is on the log-odds scale. Spline effects
+missingness indicators, all with an optional bootstrap band across the bagged
+fits. Each output is on the log-odds scale. Because the model is additive,
+`explain(X)` splits every prediction exactly into the intercept, one term per
+observed `(feature, time)` cell and one per static column (backends'
+`contributions`); `decision_function` is their sum and `term_importances_`
+their mean absolute size per term over the training rows. Spline effects
 are centred (see above), so a positive value means the observation raises the
 log-odds relative to an average observed cell of that feature (or an average
 row, for a static effect), and a negative value lowers it.
@@ -174,13 +187,13 @@ each temporal feature a single shared value-*time* surface instead of a
 value-only shape function. The cyclic boosting/bagging fitting procedure
 follows the Explainable Boosting Machine (EBM) design: shallow, per-feature
 boosting rounds cycled across features, with bagged bootstrap fits averaged
-for variance reduction (`ebm_paper.pdf`). The pairwise (feature, feature)
-interaction idea in GA2M (`ga2m_paper_existing.pdf`) is the closest prior
+for variance reduction (Lou et al., KDD 2012; Nori et al., InterpretML, 2019). The pairwise (feature, feature)
+interaction idea in GA2M (Lou et al., KDD 2013) is the closest prior
 work to treating (value, time) as a joint two-dimensional interaction term
 rather than two separate additive terms — SSTGAM applies that same
 2-D-interaction treatment to a feature's own value against its own
-observation time, rather than to two distinct features. Dynamic GAMs (DGAM,
-`dgam_paper.pdf`) are the closest prior work on modeling additive effects
+observation time, rather than to two distinct features. Dynamic GAMs (DGAM;
+Clark & Wells, Methods in Ecology and Evolution, 2023) are the closest prior work on modeling additive effects
 that vary over time in a discrete time series/forecasting setting; SSTGAM
 differs by fitting one shared surface per feature across all sparsely and
 irregularly observed time points at once, rather than a separate smooth per
@@ -207,8 +220,8 @@ forecast horizon.
   class, with all differential weighting learned from data through the
   value-time surface itself. This is a deliberate design boundary: an
   experimental variant that hard-codes a "later observations matter more"
-  day-weighting scheme (found in an unapplied patch, `boost.diff`, against
-  an earlier and since-abandoned prototype of this package) was evaluated
+  day-weighting scheme (from an earlier, abandoned prototype of this
+  package) was evaluated
   and rejected for this reason — that kind of assumption is a property of
   one dataset's temporal structure, not of longitudinal data in general, and
   baking it into the model would compromise the "agnostic baseline plus

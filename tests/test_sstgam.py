@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from sstgam import SSTGAM
+from sstgam import SSTGAM, SSTGAMRegressor
 from sstgam.bases import bspline_np, make_bspline_knots
 
 
@@ -247,3 +247,66 @@ def test_readme_quick_start_fits_tiny_data():
     model = SSTGAM(method="spline", random_state=0).fit(X, [0, 0, 1, 1])
     assert np.isfinite(model.predict_proba(X)).all()
     assert model.static_effect("age", [30, 50, 70]).shape == (3,)
+
+
+def test_input_validation(longitudinal_data):
+    X, y = longitudinal_data
+    with pytest.raises(ValueError, match="no column names"):
+        SSTGAM().fit(X.to_numpy(), y)
+    with pytest.raises(ValueError, match="exactly two classes"):
+        SSTGAM().fit(X, np.zeros_like(y))
+    with pytest.raises(ValueError, match="infinite"):
+        SSTGAM().fit(X.replace(X.iloc[0, 0], np.inf), y)
+    with pytest.warns(UserWarning, match="static_columns"):
+        SSTGAM(outer_bags=1).fit(X.rename(columns={"context": "icd_10"}), y)
+
+    labels = np.where(y == 1, "yes", "no")
+    model = SSTGAM(outer_bags=1, static_columns=["icd_10"]).fit(X.rename(columns={"context": "icd_10"}), labels)
+    assert model.static_features_ == ["icd_10"] and set(model.predict(X.rename(columns={"context": "icd_10"}))) <= {"no", "yes"}
+    with pytest.raises(ValueError, match="Unknown temporal feature"):
+        model.value_effect("signl", [0.0])
+
+
+@pytest.mark.parametrize("method", ["spline", "tree"])
+def test_explain_sums_to_the_prediction(longitudinal_data, method):
+    X, y = longitudinal_data
+    model = SSTGAM(method=method, max_rounds=12, early_stopping_rounds=4, outer_bags=3).fit(X, y)
+    explanation = model.explain(X)
+    assert explanation.temporal.shape == (len(X), 1, 2) and explanation.static.shape == (len(X), 1)
+    assert (explanation.temporal[X["signal_4"].isna().to_numpy(), 0, 1] == 0).all()
+    logit = explanation.intercept + explanation.temporal.sum(axis=(1, 2)) + explanation.static.sum(axis=1)
+    np.testing.assert_allclose(model.predict_proba(X)[:, 1], 1 / (1 + np.exp(-logit)), atol=1e-6)
+    assert list(model.term_importances_) in (["signal", "context"], ["context", "signal"])
+
+    lower, mean, upper = model.static_effect("context", [-1.0, 0.0, 1.0], return_interval=True)
+    assert (lower <= mean + 1e-12).all() and (mean <= upper + 1e-12).all()
+    np.testing.assert_allclose(mean, model.static_effect("context", [-1.0, 0.0, 1.0]), atol=1e-10)
+
+
+def test_decimal_time_ids():
+    generator = np.random.RandomState(0)
+    X = pd.DataFrame({f"signal_{t}": generator.normal(size=200) for t in ("0", "0.5", "2.25")})
+    model = SSTGAM(outer_bags=1).fit(X, (X["signal_2.25"] > 0).astype(int))
+    assert model.time_ids_ == [0, 0.5, 2.25]
+    assert model.temporal_surface("signal", [1.0], [2.25]).shape == (1, 1)
+
+
+@pytest.mark.parametrize("method", ["spline", "tree"])
+@pytest.mark.parametrize("family", ["gaussian", "poisson"])
+def test_regressor_recovers_a_temporal_effect(family, method):
+    generator = np.random.RandomState(1)
+    n = 2000
+    values = generator.normal(size=(n, 4))
+    signal = 0.5 * (values * np.linspace(0.0, 1.0, 4)).sum(axis=1)  # the effect grows over time
+    target = (signal + generator.normal(scale=0.3, size=n) if family == "gaussian"
+              else generator.poisson(np.exp(0.5 + signal)))
+    X = pd.DataFrame(values, columns=[f"signal_{t}" for t in range(4)])
+    model = SSTGAMRegressor(family=family, method=method, max_rounds=300, learning_rate=0.1,
+                            outer_bags=1).fit(X, target)
+    prediction = model.predict(X)
+    expected = signal if family == "gaussian" else np.exp(0.5 + signal)
+    assert np.corrcoef(prediction, expected)[0, 1] > 0.9
+    if family == "poisson":
+        assert (prediction > 0).all()
+    with pytest.raises(ValueError, match="family must be"):
+        SSTGAMRegressor(family="gamma").fit(X, target)
