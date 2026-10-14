@@ -7,8 +7,12 @@ from ._training import (
     FAMILIES,
     Family,
     bootstrap_bags,
+    center_pair,
+    fast_gain,
     make_validation_split,
+    pair_cells,
     percentile_band,
+    quantile_edges,
 )
 
 _MIN_HESSIAN = 1e-6
@@ -27,30 +31,27 @@ _AXIS_PENALTY_LAMBDA = 2.0
 _FIRST_AXIS_DEPTH = 2
 
 
-def _quantile_edges(values: np.ndarray, n_bins: int) -> np.ndarray:
-    """Create deduplicated quantile bin edges with at least one bin."""
-    if values.size == 0:
-        return np.array([0.0, 1.0])
-    edges = np.unique(np.quantile(values, np.linspace(0.0, 1.0, n_bins + 1)))
-    if edges.size == 1:
-        edges = np.array([edges[0] - 0.5, edges[0] + 0.5])
-    return edges.astype(np.float64)
-
-
 def boost_bag(family: Family, update_terms, snapshot, fit_target, fit_weight, validation_target,
-              validation_weight, learning_rate: float, max_rounds: int, patience: int):
+              validation_weight, learning_rate: float, max_rounds: int, patience: int, start=None):
     """Boost one bag until validation loss stops improving for ``patience`` rounds.
 
-    Starts from the mean-outcome intercept. Each round takes a damped Newton step
-    on the intercept, then calls ``update_terms(fit_score, validation_score)``,
+    Starts from the mean-outcome intercept, or from ``start = (intercept,
+    fit_score, validation_score)`` of an already fitted model, which also
+    counts as round 0. Each round takes a damped Newton step on the
+    intercept, then calls ``update_terms(fit_score, validation_score)``,
     which updates the model terms and both score arrays in place. Returns
     ``(intercept, snapshot(), best_round)`` from the best validation round.
     """
-    intercept = family.link(np.average(fit_target, weights=fit_weight))
-    fit_score = np.full(fit_target.size, intercept)
-    validation_score = np.full(validation_target.size, intercept)
-
     best_loss, best, rounds_without_improvement = np.inf, None, 0
+    if start is None:
+        intercept = family.link(np.average(fit_target, weights=fit_weight))
+        fit_score = np.full(fit_target.size, intercept)
+        validation_score = np.full(validation_target.size, intercept)
+    else:
+        intercept, fit_score, validation_score = start[0], start[1].copy(), start[2].copy()
+        best_loss = np.average(family.loss(validation_score, validation_target), weights=validation_weight)
+        best = (intercept, snapshot(), 0)
+
     for round_index in range(1, max_rounds + 1):
         mean = family.mean(fit_score)
         step = learning_rate * (np.sum(fit_weight * (fit_target - mean)) /
@@ -115,7 +116,7 @@ class SharedShapeTemporalGAMTreeBoost:
         self._value_edges = []
         for feature_index in range(values.shape[1]):
             feature_values = values[:, feature_index, :][observed[:, feature_index, :] > 0.5]
-            self._value_edges.append(_quantile_edges(feature_values, self.n_value_bins))
+            self._value_edges.append(quantile_edges(feature_values, self.n_value_bins))
 
         self._static_edges = []
         self._static_fill = np.zeros(static_values.shape[1], dtype=np.float64)
@@ -123,7 +124,7 @@ class SharedShapeTemporalGAMTreeBoost:
             column = static_values[:, column_index]
             finite_values = column[np.isfinite(column)]
             self._static_fill[column_index] = np.median(finite_values) if finite_values.size else 0.0
-            self._static_edges.append(_quantile_edges(finite_values, _N_STATIC_BINS))
+            self._static_edges.append(quantile_edges(finite_values, _N_STATIC_BINS))
 
     def _feature_bins(self, values) -> list[np.ndarray]:
         return [self._bin(np.nan_to_num(values[:, feature_index, :], nan=0.0), edges)
@@ -241,8 +242,34 @@ class SharedShapeTemporalGAMTreeBoost:
         mean = family.mean(score)
         return weight * (target - mean), weight * family.variance(mean)
 
+    def _axis_bins(self, axis, raw):
+        """Bin raw values of one pair axis with that term's own main-effect bins: ``(bins, n_bins)``."""
+        kind, index = axis
+        if kind == "temporal":
+            edges = self._value_edges[index]
+            return self._bin(np.nan_to_num(raw, nan=0.0), edges), len(edges) - 1
+        filled = np.where(np.isfinite(raw), raw, self._static_fill[index])
+        return self._bin(filled, self._static_edges[index]), len(self._static_edges[index]) - 1
+
+    def _pair_bins(self, values, observed, static_values, pair):
+        """``(cell ids, mask, n_u, n_w)`` of one pair; cell id is ``u_bin * n_w + w_bin``."""
+        u, w, mask = pair_cells(values, observed, static_values, pair)
+        (u_bins, n_u), (w_bins, n_w) = self._axis_bins(pair[0], u), self._axis_bins(pair[1], w)
+        return u_bins * n_w + w_bins, np.asarray(mask, dtype=np.float64), n_u, n_w
+
+    def _score(self, values, observed, static_values):
+        return self._intercept + sum(term.sum(axis=tuple(range(1, term.ndim)))
+                                     for term in self.contributions(values, observed, static_values))
+
     def fit(self, values, observed, static_values, time_coordinates, target,
-            sample_weight=None):
+            sample_weight=None, pairs=(), n_interactions: int = 0):
+        """Fit main effects; then, with ``n_interactions``, the best of the candidate ``pairs`` too.
+
+        Pairs are picked by FAST on the main-effects residual and fitted in a
+        second boosting stage that starts from the averaged main effects and
+        keeps updating them, with each pair update purified (``center_pair``)
+        so a pair only carries what its main effects cannot.
+        """
         values = np.asarray(values, dtype=np.float32)
         observed = np.asarray(observed, dtype=np.float64)
         target = np.asarray(target, dtype=np.float64).ravel()
@@ -280,26 +307,52 @@ class SharedShapeTemporalGAMTreeBoost:
         )
 
         rng = np.random.RandomState(self.random_state)
-        bags = [
-            self._fit_one_bag(weights, target, observed, fit_indices, validation_indices,
-                              n_value_bins, n_times, static_bins, temporal_coordinates,
-                              temporal_cell_ids, static_coordinates, rng)
-            for fit_indices in bootstrap_bags(train_indices, self.outer_bags, rng)
-        ]
-        self._bagged_feature_tables = [feature_tables for _, (feature_tables, _), _ in bags]
-        self._bagged_static_tables = [static_tables for _, (_, static_tables), _ in bags]
-        self.best_rounds_ = [best_round for _, _, best_round in bags]
+        self._pairs, self._pair_shapes = [], []
 
-        self._intercept = float(np.mean([intercept for intercept, _, _ in bags]))
-        self._feature_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_feature_tables)]
-        self._static_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_static_tables)]
+        def fit_bags(start=None, pair_data=()):
+            bags = [
+                self._fit_one_bag(weights, target, observed, fit_indices, validation_indices,
+                                  n_value_bins, n_times, static_bins, temporal_coordinates,
+                                  temporal_cell_ids, static_coordinates, rng, start, pair_data)
+                for fit_indices in bootstrap_bags(train_indices, self.outer_bags, rng)
+            ]
+            self._bagged_feature_tables = [feature_tables for _, (feature_tables, _, _), _ in bags]
+            self._bagged_static_tables = [static_tables for _, (_, static_tables, _), _ in bags]
+            self._bagged_pair_tables = [pair_tables for _, (_, _, pair_tables), _ in bags]
+            self.best_rounds_ = [best_round for _, _, best_round in bags]
+            self._intercept = float(np.mean([intercept for intercept, _, _ in bags]))
+            self._feature_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_feature_tables)]
+            self._static_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_static_tables)]
+            self._pair_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_pair_tables)]
+
+        fit_bags()
+        if n_interactions and pairs:
+            score = self._score(values, observed, static_values)
+            pair_data = [self._pair_bins(values, observed, static_values, pair) for pair in pairs]
+            if n_interactions < len(pairs):
+                gradient, hessian = self._grad_hess(score, target, weights)
+                gains = [fast_gain(gradient, hessian, *data) for data in pair_data]
+                keep = np.argsort(gains, kind="stable")[::-1][:n_interactions]
+                pairs, pair_data = [pairs[i] for i in keep], [pair_data[i] for i in keep]
+            self._pairs, self._pair_shapes = list(pairs), [(n_u, n_w) for _, _, n_u, n_w in pair_data]
+            fit_bags(start=(self._intercept, [table.copy() for table in self._feature_tables],
+                            [table.copy() for table in self._static_tables], score), pair_data=pair_data)
         return self
 
     def _fit_one_bag(self, weights, target, observed, fit_indices, validation_indices,
                      n_value_bins, n_times, static_bins, temporal_coordinates,
-                     temporal_cell_ids, static_coordinates, rng):
-        feature_tables = [np.zeros(bin_count * n_times) for bin_count in n_value_bins]
-        static_tables = [np.zeros(len(edges) - 1) for edges in self._static_edges]
+                     temporal_cell_ids, static_coordinates, rng, start=None, pair_data=()):
+        if start is None:
+            feature_tables = [np.zeros(bin_count * n_times) for bin_count in n_value_bins]
+            static_tables = [np.zeros(len(edges) - 1) for edges in self._static_edges]
+        else:
+            feature_tables = [table.copy() for table in start[1]]
+            static_tables = [table.copy() for table in start[2]]
+        pair_tables = [np.zeros(n_u * n_w) for _, _, n_u, n_w in pair_data]
+        pair_coordinates = [np.column_stack((np.repeat(np.arange(n_u), n_w), np.tile(np.arange(n_w), n_u)))
+                            .astype(np.float64) for _, _, n_u, n_w in pair_data]
+        pair_weights = [np.bincount(cells[fit_indices].ravel(), mask[fit_indices].ravel(), n_u * n_w)
+                        .reshape(n_u, n_w) for cells, mask, n_u, n_w in pair_data]
         fit_target, fit_weight = target[fit_indices], weights[fit_indices]
         fit_observed, validation_observed = observed[fit_indices], observed[validation_indices]
         fit_cells = [cell_ids[fit_indices] for cell_ids in temporal_cell_ids]
@@ -333,12 +386,31 @@ class SharedShapeTemporalGAMTreeBoost:
                 fit_score += update[static_bins[column_index][fit_indices]]
                 validation_score += update[static_bins[column_index][validation_indices]]
 
+            for pair_index, table in enumerate(pair_tables):
+                cells, mask, n_u, n_w = pair_data[pair_index]
+                gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
+                fit_cells_pair, fit_mask = cells[fit_indices].ravel(), mask[fit_indices]
+                update = self._tree_update(
+                    pair_coordinates[pair_index],
+                    np.bincount(fit_cells_pair, (gradient[:, None] * fit_mask).ravel(), table.size),
+                    np.bincount(fit_cells_pair, (hessian[:, None] * fit_mask).ravel(), table.size), rng,
+                )
+                if update is None:
+                    continue
+                update = center_pair(self.learning_rate * update.reshape(n_u, n_w), pair_weights[pair_index]).ravel()
+                table += update
+                fit_score += (update[cells[fit_indices]] * fit_mask).sum(axis=1)
+                validation_score += (update[cells[validation_indices]] * mask[validation_indices]).sum(axis=1)
+
         def snapshot():
-            return [table.copy() for table in feature_tables], [table.copy() for table in static_tables]
+            return ([table.copy() for table in feature_tables], [table.copy() for table in static_tables],
+                    [table.copy() for table in pair_tables])
 
         return boost_bag(FAMILIES[self.family], update_terms, snapshot, fit_target, fit_weight,
                          target[validation_indices], weights[validation_indices],
-                         self.learning_rate, self.max_rounds, self.early_stopping_rounds)
+                         self.learning_rate, self.max_rounds, self.early_stopping_rounds,
+                         start=None if start is None else (start[0], start[3][fit_indices],
+                                                           start[3][validation_indices]))
 
     def contributions(self, values, observed, static_values):
         """Per-cell temporal ``(n, features, times)`` and per-column static ``(n, statics)`` terms.
@@ -355,7 +427,21 @@ class SharedShapeTemporalGAMTreeBoost:
         static = np.zeros(static_values.shape, dtype=np.float64)
         for column_index, bins in enumerate(self._static_bins(static_values)):
             static[:, column_index] = self._static_tables[column_index][bins]
-        return temporal, static
+        pairs = np.zeros((values.shape[0], len(self._pairs)))
+        for pair_index, pair in enumerate(self._pairs):
+            cells, mask, _, _ = self._pair_bins(values, observed, static_values, pair)
+            pairs[:, pair_index] = (self._pair_tables[pair_index][cells] * mask).sum(axis=1)
+        return temporal, static, pairs
+
+    def interaction_surface(self, pair_index: int, u_values, w_values, return_interval: bool = False):
+        """Pair table looked up on a grid of raw values: ``(len(u_values), len(w_values))``."""
+        pair, (n_u, n_w) = self._pairs[pair_index], self._pair_shapes[pair_index]
+        u_bins, _ = self._axis_bins(pair[0], np.asarray(u_values, dtype=np.float64))
+        w_bins, _ = self._axis_bins(pair[1], np.asarray(w_values, dtype=np.float64))
+        tables = np.stack([bag[pair_index].reshape(n_u, n_w)[np.ix_(u_bins, w_bins)]
+                           for bag in self._bagged_pair_tables])
+        return percentile_band(tables) if return_interval else self._pair_tables[pair_index].reshape(
+            n_u, n_w)[np.ix_(u_bins, w_bins)]
 
     def value_time_table(self, feature_index: int, return_interval: bool = False):
         """Return ``(value_bin_edges, log_odds_table)`` for one feature.

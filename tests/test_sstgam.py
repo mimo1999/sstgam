@@ -310,3 +310,60 @@ def test_regressor_recovers_a_temporal_effect(family, method):
         assert (prediction > 0).all()
     with pytest.raises(ValueError, match="family must be"):
         SSTGAMRegressor(family="gamma").fit(X, target)
+
+
+def interaction_data(n, seed):
+    generator = np.random.RandomState(seed)
+    creatinine, urea, lactate = (generator.normal(size=(n, 4)) for _ in range(3))
+    age = generator.normal(size=n)
+    for signal in (creatinine, urea, lactate):
+        signal[generator.rand(n, 4) < 0.2] = np.nan
+    filled = np.nan_to_num
+    score = (-1 + 0.3 * filled(creatinine).sum(1) + 0.5 * age
+             + (0.6 * filled(creatinine) * filled(urea) + 0.5 * filled(lactate) * age[:, None]).sum(1))
+    target = (generator.rand(n) < 1 / (1 + np.exp(-score))).astype(int)
+    columns = {}
+    for name, signal in (("creatinine", creatinine), ("urea", urea), ("lactate", lactate)):
+        columns |= {f"{name}_{t}": signal[:, t] for t in range(4)}
+    return pd.DataFrame(columns | {"age": age}), target
+
+
+@pytest.mark.parametrize("method", ["spline", "tree"])
+def test_interactions_recover_planted_pairs(method):
+    X, y = interaction_data(3000, 0)
+    X_test, y_test = interaction_data(3000, 1)
+    settings = {"method": method, "outer_bags": 1, "learning_rate": 0.1, "max_rounds": 300,
+                "early_stopping_rounds": 20}
+    main_only = SSTGAM(**settings).fit(X, y)
+    model = SSTGAM(interactions=2, **settings).fit(X, y)
+    assert set(model.interaction_terms_) == {("creatinine", "urea"), ("lactate", "age")}
+
+    def test_loss(fitted):
+        p = fitted.predict_proba(X_test)[:, 1]
+        return -np.mean(y_test * np.log(p) + (1 - y_test) * np.log(1 - p))
+    assert test_loss(model) < test_loss(main_only) - 0.03
+
+    grid = np.linspace(-1.5, 1.5, 7)
+    surface = model.interaction_surface("creatinine", "urea", grid, grid)
+    assert np.corrcoef(surface.ravel(), np.outer(grid, grid).ravel())[0, 1] > 0.8
+    np.testing.assert_allclose(model.interaction_surface("urea", "creatinine", grid, grid), surface.T)
+
+    explanation = model.explain(X)
+    assert explanation.pairs.shape == (len(X), 2)
+    assert abs(explanation.pairs.mean(axis=0)).max() < 0.1  # purified: no main effect hiding in a pair
+    logit = (explanation.intercept + explanation.temporal.sum(axis=(1, 2)) + explanation.static.sum(axis=1)
+             + explanation.pairs.sum(axis=1))
+    np.testing.assert_allclose(model.decision_function(X), logit)
+    assert "creatinine x urea" in model.term_importances_
+
+
+def test_explicit_interaction_list(longitudinal_data):
+    X, y = longitudinal_data
+    model = SSTGAM(outer_bags=1, interactions=[("context", "signal")]).fit(X, y)
+    assert model.interaction_terms_ == [("signal", "context")]
+    lower, mean, upper = model.interaction_surface("context", "signal", [0.0, 1.0], [0.0], return_interval=True)
+    assert lower.shape == mean.shape == upper.shape == (2, 1)
+    with pytest.raises(ValueError, match="No fitted interaction"):
+        model.interaction_surface("signal", "signal", [0.0], [0.0])
+    with pytest.raises(ValueError, match="Unknown feature"):
+        SSTGAM(interactions=[("signal", "missing")]).fit(X, y)

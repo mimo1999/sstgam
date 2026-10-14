@@ -82,3 +82,68 @@ def percentile_band(samples: np.ndarray):
     """``(lower, mean, upper)`` over the first axis: the 2.5/97.5 percentiles across bags and their mean."""
     lower, upper = np.percentile(samples, [2.5, 97.5], axis=0)
     return lower, samples.mean(axis=0), upper
+
+
+def quantile_edges(values: np.ndarray, n_bins: int) -> np.ndarray:
+    """Create deduplicated quantile bin edges with at least one bin."""
+    if values.size == 0:
+        return np.array([0.0, 1.0])
+    edges = np.unique(np.quantile(values, np.linspace(0.0, 1.0, n_bins + 1)))
+    if edges.size == 1:
+        edges = np.array([edges[0] - 0.5, edges[0] + 0.5])
+    return edges.astype(np.float64)
+
+
+def pair_cells(values, observed, static_values, pair):
+    """Raw ``(u, w, mask)``, each ``(n, cells)``, for a pair of axes ``("temporal", k)`` / ``("static", j)``.
+
+    Signal x signal: one cell per time, used when both were measured. Signal
+    x static: one cell per time the signal was measured, the static value
+    repeated. Static x static: one cell per row. A temporal axis comes first.
+    """
+    (kind_u, u_index), (kind_w, w_index) = pair
+    if kind_u == "static":
+        return (static_values[:, u_index, None], static_values[:, w_index, None],
+                np.ones((static_values.shape[0], 1)))
+    u, mask = values[:, u_index, :], observed[:, u_index, :]
+    if kind_w == "temporal":
+        return u, values[:, w_index, :], mask * observed[:, w_index, :]
+    return u, np.broadcast_to(static_values[:, w_index, None], u.shape), mask
+
+
+def fast_gain(gradient, hessian, cells, mask, n_u: int, n_w: int) -> float:
+    """FAST pair score (Lou et al., KDD 2013) on the main-effects residual.
+
+    Bins each row's gradient and curvature into the pair's ``(n_u, n_w)``
+    grid (``cells`` holds ``u_bin * n_w + w_bin``), then scores the best
+    split into four quadrants by one cut on each axis: the Newton loss
+    reduction ``sum G^2/H`` over the quadrants minus that of no split.
+    """
+    def grid(row_values):
+        return np.bincount(cells.ravel(), (row_values[:, None] * mask).ravel(), n_u * n_w).reshape(n_u, n_w)
+
+    if n_u < 2 or n_w < 2:
+        return 0.0
+    gradient_sums = grid(gradient).cumsum(0).cumsum(1)
+    hessian_sums = grid(hessian).cumsum(0).cumsum(1)
+
+    def quadrants(sums):
+        low_low, low, left, total = sums[:-1, :-1], sums[:-1, -1:], sums[-1:, :-1], sums[-1, -1]
+        return low_low, low - low_low, left - low_low, total - low - left + low_low
+
+    gain = sum(g ** 2 / np.maximum(h, 1e-12) for g, h in zip(quadrants(gradient_sums), quadrants(hessian_sums)))
+    return float(gain.max() - gradient_sums[-1, -1] ** 2 / max(hessian_sums[-1, -1], 1e-12))
+
+
+def center_pair(table: np.ndarray, weight: np.ndarray, sweeps: int = 10) -> np.ndarray:
+    """Remove a pair table's weighted row and column means, leaving pure interaction (EBM's purification).
+
+    ``weight`` is the data count per cell. Alternating the two projections
+    converges to zero weighted marginals; a few sweeps are plenty.
+    """
+    table = table.copy()
+    for axis in (1, 0) * sweeps:
+        totals = weight.sum(axis=axis)
+        means = np.divide((weight * table).sum(axis=axis), totals, out=np.zeros_like(totals), where=totals > 0)
+        table -= np.expand_dims(means, axis)
+    return table

@@ -1,5 +1,6 @@
 """Public SSTGAM estimators: a binary classifier and a regressor for counts or continuous outcomes."""
 
+import itertools
 import re
 import warnings
 from collections.abc import Iterable
@@ -24,15 +25,17 @@ _Effect = np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray]
 class Explanation(NamedTuple):
     """Per-row additive breakdown of the linear predictor (log-odds for ``SSTGAM``).
 
-    ``intercept + temporal.sum(axis=(1, 2)) + static.sum(axis=1)`` equals
-    ``decision_function(X)``. ``temporal[i, k, t]`` is what row ``i``'s value
-    of ``temporal_features_[k]`` at ``time_ids_[t]`` adds (0 when missing);
-    ``static[i, s]`` is what ``static_features_[s]`` adds.
+    ``intercept + temporal.sum(axis=(1, 2)) + static.sum(axis=1) +
+    pairs.sum(axis=1)`` equals ``decision_function(X)``. ``temporal[i, k, t]``
+    is what row ``i``'s value of ``temporal_features_[k]`` at ``time_ids_[t]``
+    adds (0 when missing); ``static[i, s]`` is what ``static_features_[s]``
+    adds; ``pairs[i, j]`` is what interaction ``interaction_terms_[j]`` adds.
     """
 
     intercept: float
     temporal: np.ndarray
     static: np.ndarray
+    pairs: np.ndarray
 
 
 class _SSTGAMBase(BaseEstimator):
@@ -59,6 +62,8 @@ class _SSTGAMBase(BaseEstimator):
         include_missingness_indicators: bool = False,
         val_fraction: float = 0.15,
         static_columns: Iterable[str] | None = None,
+        interactions: int | Iterable[tuple[str, str]] = 0,
+        n_pair_bases: int = 6,
         random_state: int = 42,
     ) -> None:
         self.method = method
@@ -78,6 +83,8 @@ class _SSTGAMBase(BaseEstimator):
         self.include_missingness_indicators = include_missingness_indicators
         self.val_fraction = val_fraction
         self.static_columns = static_columns
+        self.interactions = interactions
+        self.n_pair_bases = n_pair_bases
         self.random_state = random_state
 
     def _parse_columns(self, column_names: list[str]):
@@ -215,21 +222,51 @@ class _SSTGAMBase(BaseEstimator):
 
         values, observed, static_values = self._build_tensors(matrix)
         self._validate_hyperparameters()
+        pairs, n_interactions = self._candidate_pairs()
         self.model_ = self._make_trainer().fit(
             values, observed, static_values,
             np.asarray(self.time_ids_, dtype=np.float32), target,
-            sample_weight=sample_weight,
+            sample_weight=sample_weight, pairs=pairs, n_interactions=n_interactions,
         )
+        self.interaction_terms_ = [(self._axis_name(u), self._axis_name(w)) for u, w in self.model_._pairs]
         explanation = self._explain_matrix(matrix)
         importances = {name: float(np.abs(explanation.temporal[:, index].sum(axis=1)).mean())
                        for index, name in enumerate(self.temporal_features_)}
         importances.update({name: float(np.abs(explanation.static[:, index]).mean())
                             for index, name in enumerate(self.static_features_)})
+        importances.update({f"{u} x {w}": float(np.abs(explanation.pairs[:, index]).mean())
+                            for index, (u, w) in enumerate(self.interaction_terms_)})
         self.term_importances_ = dict(sorted(importances.items(), key=lambda item: -item[1]))
 
+    def _axis(self, name: str):
+        if name in self.temporal_features_:
+            return ("temporal", self.temporal_features_.index(name))
+        if name in self.static_features_:
+            return ("static", self.static_features_.index(name))
+        raise ValueError(f"Unknown feature {name!r} in interactions; fitted features: "
+                         f"{self.temporal_features_ + self.static_features_}")
+
+    def _axis_name(self, axis) -> str:
+        kind, index = axis
+        return (self.temporal_features_ if kind == "temporal" else self.static_features_)[index]
+
+    def _candidate_pairs(self):
+        """``(candidate pairs, how many to keep)``; each pair is two axes, a temporal one first."""
+        if isinstance(self.interactions, int | np.integer):
+            axes = ([("temporal", index) for index in range(len(self.temporal_features_))]
+                    + [("static", index) for index in range(len(self.static_features_))])
+            return list(itertools.combinations(axes, 2)), int(self.interactions)
+        pairs = []
+        for first, second in self.interactions:
+            pair = sorted((self._axis(first), self._axis(second)), key=lambda axis: axis[0] != "temporal")
+            if pair[0] == pair[1]:
+                raise ValueError(f"An interaction needs two different features, got {(first, second)}")
+            pairs.append(tuple(pair))
+        return pairs, len(pairs)
+
     def _explain_matrix(self, matrix: np.ndarray) -> Explanation:
-        temporal, static = self.model_.contributions(*self._build_tensors(matrix))
-        return Explanation(self.model_._intercept, temporal, static)
+        temporal, static, pairs = self.model_.contributions(*self._build_tensors(matrix))
+        return Explanation(self.model_._intercept, temporal, static, pairs)
 
     def explain(self, X) -> Explanation:
         """Break each row's prediction into the intercept plus one term per observed cell and static column.
@@ -244,7 +281,8 @@ class _SSTGAMBase(BaseEstimator):
     def decision_function(self, X) -> np.ndarray:
         """Linear predictor per row (log-odds for ``SSTGAM``): the sum of ``explain(X)``."""
         explanation = self.explain(X)
-        return explanation.intercept + explanation.temporal.sum(axis=(1, 2)) + explanation.static.sum(axis=1)
+        return (explanation.intercept + explanation.temporal.sum(axis=(1, 2)) + explanation.static.sum(axis=1)
+                + explanation.pairs.sum(axis=1))
 
     def _validate_hyperparameters(self) -> None:
         if self.method not in {"spline", "tree"}:
@@ -264,6 +302,10 @@ class _SSTGAMBase(BaseEstimator):
             raise ValueError("learning_rate must be positive.")
         if self.max_rounds < 1 or self.early_stopping_rounds < 1 or self.outer_bags < 1:
             raise ValueError("max_rounds, early_stopping_rounds, and outer_bags must be positive.")
+        if isinstance(self.interactions, int | np.integer) and self.interactions < 0:
+            raise ValueError("interactions must be a non-negative number of pairs or a list of feature pairs.")
+        if self.n_pair_bases < 2:
+            raise ValueError("n_pair_bases must be at least 2.")
 
     def _make_trainer(self):
         if self.method == "tree":
@@ -290,6 +332,8 @@ class _SSTGAMBase(BaseEstimator):
             val_fraction=self.val_fraction,
             random_state=self.random_state,
             family=self._family,
+            n_pair_bases=self.n_pair_bases,
+            n_pair_bins=self.n_value_bins,
         )
 
     def _temporal_index(self, feature: str) -> int:
@@ -346,6 +390,33 @@ class _SSTGAMBase(BaseEstimator):
             raise ValueError(f"Unknown static feature {feature!r}; fitted static features: {self.static_features_}")
         return self.model_.static_effect(self.static_features_.index(feature), np.atleast_1d(values),
                                          return_interval=return_interval)
+
+    def interaction_surface(self, first: str, second: str, first_values, second_values,
+                            return_interval: bool = False) -> _Effect:
+        """Evaluate a fitted interaction on a grid: shape ``(len(first_values), len(second_values))``.
+
+        The pair must be in ``interaction_terms_`` (in either order). Units
+        are the link scale; the surface has no main effect of its own, so it
+        reads as "how much more (or less) the two together add than their
+        separate effects". Signal x signal pairs act on each time both were
+        measured, signal x static pairs on each time the signal was measured.
+        With ``return_interval=True``, returns a ``(lower, mean, upper)``
+        bootstrap percentile band across the bagged fits.
+        """
+        check_is_fitted(self, "model_")
+        if (first, second) in self.interaction_terms_:
+            index, swap = self.interaction_terms_.index((first, second)), False
+        elif (second, first) in self.interaction_terms_:
+            index, swap = self.interaction_terms_.index((second, first)), True
+        else:
+            raise ValueError(f"No fitted interaction between {first!r} and {second!r}; fitted: "
+                             f"{self.interaction_terms_}")
+        u_values, w_values = (second_values, first_values) if swap else (first_values, second_values)
+        result = self.model_.interaction_surface(index, np.atleast_1d(u_values), np.atleast_1d(w_values),
+                                                 return_interval=return_interval)
+        if not swap:
+            return result
+        return tuple(part.T for part in result) if return_interval else result.T
 
     def value_time_table(self, feature: str, return_interval: bool = False) -> tuple[np.ndarray, ...]:
         """Return the tree backend's fitted value-bin by time-bin table.
@@ -433,6 +504,16 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
     static_columns : list of str, optional
         Column names to treat as static even though they end in ``_<number>``
         (e.g. ``icd_10``).
+    interactions : int or list of (str, str), default=0
+        Pairwise interaction terms, as in EBM/GA2M. An integer K fits the K
+        pairs with the largest FAST gain on the main-effects residual, out of
+        every signal x signal, signal x static and static x static pair; a
+        list such as ``[("creatinine", "urea"), ("lactate", "age")]`` fits
+        exactly those. Each pair is a 2-D surface shared across time with no
+        main effect of its own, so the main effects keep their meaning.
+    n_pair_bases : int, default=6
+        Bases per axis of each spline interaction surface. Tree interactions
+        reuse their two terms' bins, and pair ranking uses ``n_value_bins``.
     random_state
         Random seed (validation split, bootstrap bags, tree fitting).
 
@@ -442,9 +523,12 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
         The two labels; probabilities and effects refer to ``classes_[1]``.
     temporal_features_, static_features_, time_ids_
         Parsed feature names and the sorted time ids.
+    interaction_terms_ : list of (str, str)
+        The fitted interaction pairs.
     term_importances_ : dict
         Mean absolute log-odds contribution of each term over the training
-        rows, largest first (the temporal terms summed over time per row).
+        rows, largest first (the temporal terms summed over time per row;
+        interactions named ``"a x b"``).
     """
 
     def fit(self, X, y, feature_names: Iterable[str] | None = None, sample_weight=None) -> "SSTGAM":
@@ -499,6 +583,8 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
         include_missingness_indicators: bool = False,
         val_fraction: float = 0.15,
         static_columns: Iterable[str] | None = None,
+        interactions: int | Iterable[tuple[str, str]] = 0,
+        n_pair_bases: int = 6,
         random_state: int = 42,
     ) -> None:
         super().__init__(
@@ -508,7 +594,8 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
             learning_rate=learning_rate, max_rounds=max_rounds, outer_bags=outer_bags,
             early_stopping_rounds=early_stopping_rounds,
             include_missingness_indicators=include_missingness_indicators, val_fraction=val_fraction,
-            static_columns=static_columns, random_state=random_state,
+            static_columns=static_columns, interactions=interactions, n_pair_bases=n_pair_bases,
+            random_state=random_state,
         )
         self.family = family
 

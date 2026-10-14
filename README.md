@@ -139,6 +139,43 @@ wide = bin_timestamps(observations, id_col="patient", time_col="hour", feature_c
 Datetime times work with a `pd.Timedelta` bin width; the columns are then
 numbered by bin.
 
+## Interactions (experimental)
+
+Like EBM/GA2M, SSTGAM can add pairwise interaction terms on top of its main
+effects. They are opt-in and still being validated: the pair ranking has known
+limitations described in [ARCHITECTURE.md](https://github.com/mimo1999/sstgam/blob/main/ARCHITECTURE.md).
+
+```python
+model = SSTGAM(interactions=3).fit(X_train, y_train)  # the 3 strongest pairs
+model.interaction_terms_  # e.g. [("signal_a", "signal_b"), ("signal_a", "age"), ...]
+```
+
+- `interactions=K` ranks every signal x signal, signal x static and static x
+  static pair with FAST (Lou et al., KDD 2013) on what the main effects leave
+  unexplained, and fits the top K. Pass a list such as
+  `[("creatinine", "urea"), ("lactate", "age")]` to choose the pairs yourself.
+- A signal x signal pair adds `h(value_a(t), value_b(t))` at every time both
+  were measured; a signal x static pair adds `h(value_a(t), age)` at every
+  time the signal was measured. The surface `h` is shared across time, like
+  the main effects.
+- Pairs are purified: they hold only what the two terms do together beyond
+  their separate effects, so the main-effect plots keep their meaning.
+- Inspect one with `interaction_surface`; `explain(X).pairs` and
+  `term_importances_` include them.
+
+```python
+import matplotlib.pyplot as plt
+import numpy as np
+
+grid = np.linspace(-2, 2, 40)
+surface = model.interaction_surface("signal_a", "signal_b", grid, grid)  # (40, 40), log-odds
+plt.pcolormesh(grid, grid, surface.T, cmap="RdBu_r", shading="nearest")
+plt.xlabel("signal_a"); plt.ylabel("signal_b"); plt.colorbar(label="log-odds")
+```
+
+Each pair adds parameters and fit time, so start with a few and keep the ones
+`term_importances_` ranks high.
+
 ## Interpreting outputs
 
 Every effect is on the model's link scale: **log-odds** of the second class
@@ -153,11 +190,12 @@ spline effects average zero over the training data, so positive means
 | `value_effect(feature, values)` | spline | array `(len(values),)`: the surface averaged over time |
 | `value_time_table(feature)` | tree | `(value_bin_edges, table)`, table `(n_bins, len(model.time_ids_))`, edges in raw units |
 | `static_effect(feature, values)` | both | array `(len(values),)` for a static covariate |
-| `explain(X)` | both | `Explanation(intercept, temporal, static)`: per-row terms, `temporal` `(n_rows, len(model.temporal_features_), len(model.time_ids_))`, `static` `(n_rows, len(model.static_features_))` |
+| `interaction_surface(a, b, values_a, values_b)` | both | array `(len(values_a), len(values_b))` for a pair in `model.interaction_terms_` |
+| `explain(X)` | both | `Explanation(intercept, temporal, static, pairs)`: per-row terms, `temporal` `(n_rows, len(model.temporal_features_), len(model.time_ids_))`, `static` `(n_rows, len(model.static_features_))`, `pairs` `(n_rows, len(model.interaction_terms_))` |
 | `decision_function(X)` | both | array `(n_rows,)`: the link-scale prediction, the sum of `explain(X)` |
 | `term_importances_` | both | dict of each term's mean absolute contribution over the training rows, largest first |
 
-`temporal_surface`, `value_effect`, `static_effect` and `value_time_table` take
+`temporal_surface`, `value_effect`, `static_effect`, `interaction_surface` and `value_time_table` take
 `return_interval=True` and then return `(lower, mean, upper)`: the 2.5 and
 97.5 percentiles across the `outer_bags` bootstrap fits. With the default 4
 bags this is a rough stability check, not a calibrated interval; raise
@@ -212,9 +250,8 @@ one-dimensional static effect. This is an additive time-varying model: it
 does not directly model lags, slopes, or interactions between successive
 measurements. Supply those as input features if they are needed.
 
-Pairwise interaction terms between features (as in EBM/GA2M) are currently
-disabled: every feature contributes on its own. They are planned for a later
-release.
+Pairwise interactions between features are optional and experimental (see
+[Interactions](#interactions-experimental)).
 
 The spline method is a penalized GAM solved directly by P-IRLS, with the
 smoothness penalty chosen on held-out data. The tree method is fitted by

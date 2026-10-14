@@ -164,6 +164,52 @@ shared basis is another coefficient vector, and a mean of value-time tables is
 another table, so the fitted `f_k` stays exactly as defined above. Bagging is a
 variance-reduction step only. Set `outer_bags=1` to disable it.
 
+## Interactions
+
+With `interactions`, the model gains pairwise terms, following GA2M/EBM:
+
+```text
+logit(p_i) = ... + sum_pairs sum_cells mask[i, c] * h_ab(u[i, c], w[i, c])
+```
+
+A pair is two axes, each a temporal feature or a static covariate
+(`_training.pair_cells`). Signal x signal pairs have one cell per time,
+used when both signals were measured; signal x static pairs one cell per time
+the signal was measured, with the static value repeated; static x static
+pairs one cell per row. `h_ab` is a 2-D surface shared across time, the same
+pooling the main effects use. A pair that also varies with time would be a
+3-D surface and is not modelled.
+
+**Selection.** After the main effects are fitted, every candidate pair is
+scored by FAST (Lou et al., KDD 2013; `_training.fast_gain`): each row's
+gradient and curvature at the main-effects fit are binned into the pair's
+2-D grid, and the score is the best Newton loss reduction from one cut on
+each axis (four quadrants). The top `interactions` pairs are kept; an
+explicit list skips the ranking.
+
+**Purity.** A pair holds only what its two terms do together. The spline
+method builds this into the basis, as mgcv's `ti()` does: each axis basis is
+centred over the pair's cells before the tensor product, so the surface has
+no main effect of its own. The tree method centres every boosting update of a
+pair table on its weighted rows and columns (`_training.center_pair`, EBM's
+purification), keeping the main effects in the main-effect tables.
+
+**Fitting.** The spline method appends the pair blocks to its single design
+matrix and refits everything jointly by P-IRLS, warm-started from the
+main-effects fit, with the main-effects penalty on a second-difference
+penalty over both pair axes. The tree method runs a second boosting stage
+from the averaged main effects, updating main effects and pairs together
+until validation loss stops improving. Both bag the second stage like the
+first.
+
+**Known limitations (interactions are experimental).** FAST copies each row's
+residual to every cell of the row, so frequently measured features get more
+weight in the ranking; the tree method ranks pairs on all training rows,
+including the validation split it later uses for early stopping; every pair of
+terms is a candidate, so the cost grows with the square of the number of
+terms; and the number of pairs is fixed by the user rather than chosen by the
+data.
+
 ## Interpretation
 
 Spline models expose `value_effect` and `temporal_surface`. Tree models expose
@@ -173,7 +219,8 @@ fits. Each output is on the log-odds scale. Because the model is additive,
 `explain(X)` splits every prediction exactly into the intercept, one term per
 observed `(feature, time)` cell and one per static column (backends'
 `contributions`); `decision_function` is their sum and `term_importances_`
-their mean absolute size per term over the training rows. Spline effects
+their mean absolute size per term over the training rows; interactions
+add a `pairs` part and `interaction_surface`. Spline effects
 are centred (see above), so a positive value means the observation raises the
 log-odds relative to an average observed cell of that feature (or an average
 row, for a static effect), and a negative value lowers it.
