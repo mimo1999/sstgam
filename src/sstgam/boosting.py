@@ -127,9 +127,11 @@ class SharedShapeTemporalGAMBoost:
         n_pair_bases: int = 6,
         n_pair_bins: int = 16,
         penalty_sharing: str = "per_term",
+        missing_effects: bool = False,
     ) -> None:
         self.family = family
         self.penalty_sharing = penalty_sharing
+        self.missing_effects = missing_effects
         self.n_pair_bases = n_pair_bases
         self.n_pair_bins = n_pair_bins
         self.n_value_bases = n_value_bases
@@ -549,6 +551,14 @@ class SharedShapeTemporalGAMBoost:
             basis = self._centering_basis(temporal_design[:, k, :].sum(axis=0) / observed_cells[k])
             terms.append(_Term("temporal", k, (temporal_design[:, k, :] @ basis).astype(np.float32), basis,
                                surface_pieces, "temporal"))
+        if self.missing_effects:
+            # Measurement process: a smooth, time-varying effect u_k(tau) of feature k NOT being measured.
+            time_difference = second_diff_matrix_np(self.n_time_bases)
+            missing_pieces = [("time", time_difference.T @ time_difference), ("shrink", np.eye(self.n_time_bases))]
+            for k in range(n_features):
+                block = (1.0 - observed[:, k, :]).astype(np.float64) @ self._time_basis
+                basis = self._centering_basis(block.mean(axis=0))
+                terms.append(_Term("missing", k, (block @ basis).astype(np.float32), basis, missing_pieces, "temporal"))
         if static_design is not None:
             static_pieces = self._static_pieces(self.n_static_bases, shrink=reml)
             for j in range(n_static):
@@ -610,13 +620,14 @@ class SharedShapeTemporalGAMBoost:
             self._bagged_temporal_coefficients = []
             self._bagged_static_coefficients = []
             self._bagged_pair_coefficients = []
+            self._bagged_missing_coefficients = []
             self.n_iter_ = []
             for fit_indices in bootstrap_bags(np.arange(n_samples), self.outer_bags, rng):
                 beta, n_iter = self._penalized_newton(
                     design[fit_indices], target[fit_indices], sample_weight[fit_indices], penalty,
                     initial=initial,
                 )
-                coefficients: dict[str, list[np.ndarray]] = {"temporal": [], "static": [], "pair": []}
+                coefficients: dict[str, list[np.ndarray]] = {"temporal": [], "static": [], "pair": [], "missing": []}
                 start = 1
                 for term in terms:
                     size = term.design.shape[1]
@@ -627,6 +638,8 @@ class SharedShapeTemporalGAMBoost:
                 self._bagged_static_coefficients.append(
                     np.stack(coefficients["static"]) if coefficients["static"] else None)
                 self._bagged_pair_coefficients.append(coefficients["pair"])
+                self._bagged_missing_coefficients.append(
+                    np.stack(coefficients["missing"]) if coefficients["missing"] else None)
                 self.n_iter_.append(n_iter)
 
             self._intercept = float(np.mean(self._bagged_intercepts))
@@ -634,14 +647,16 @@ class SharedShapeTemporalGAMBoost:
             self._static_coefficients = (None if static_design is None
                                          else np.mean(self._bagged_static_coefficients, axis=0))
             self._pair_coefficients = [np.mean(bags, axis=0) for bags in zip(*self._bagged_pair_coefficients)]
+            self._missing_coefficients = (np.mean(self._bagged_missing_coefficients, axis=0)
+                                          if self.missing_effects else None)
 
         self._pairs, self._pair_bases = [], []
         fit_bags(terms, initial, main_penalty if reml else None)
         if n_interactions and pairs:
             pairs = list(pairs)
             if n_interactions < len(pairs):
-                temporal, static, _ = self.contributions(values, observed, static_values)
-                eta = self._intercept + temporal.sum(axis=(1, 2)) + static.sum(axis=1)
+                temporal, static, _, missing = self.contributions(values, observed, static_values)
+                eta = self._intercept + temporal.sum(axis=(1, 2)) + static.sum(axis=1) + missing.sum(axis=(1, 2))
                 pairs = self._rank_pairs(values, observed, static_values, target, sample_weight, eta,
                                          pairs, n_interactions)
             pair_blocks = [self._pair_design(values, observed, static_values, pair) for pair in pairs]
@@ -668,9 +683,11 @@ class SharedShapeTemporalGAMBoost:
         return float(np.clip(_AUTO_PENALTY_SCALE * n_coefficients / minority, low, high))
 
     def contributions(self, values, observed, static_values):
-        """Per-cell temporal ``(n, features, times)`` and per-column static ``(n, statics)`` terms.
+        """Per-cell temporal, per-column static, per-pair and per-cell "not measured" terms.
 
-        Together with ``_intercept`` they sum to the linear predictor; missing cells contribute 0.
+        Shapes ``(n, features, times)``, ``(n, statics)``, ``(n, pairs)`` and ``(n, features, times)``; with
+        ``_intercept`` they sum to the linear predictor. A missing cell adds nothing to ``temporal``; with
+        ``missing_effects`` it adds its "not measured" effect to the last array instead.
         """
         values = np.nan_to_num(np.asarray(values, dtype=np.float32), nan=0.0)
         observed = np.asarray(observed, dtype=np.float32)
@@ -690,7 +707,18 @@ class SharedShapeTemporalGAMBoost:
             u, w, mask = pair_cells(values, observed, static_values, pair)
             surface = (self._pair_basis(pair[0], u) @ self._pair_coefficients[pair_index]) * self._pair_basis(pair[1], w)
             pairs[:, pair_index] = (surface.sum(axis=-1) * mask).sum(axis=1)
-        return temporal, static, pairs
+        missing = np.zeros(values.shape, dtype=np.float64)
+        if self._missing_coefficients is not None:
+            effect = self._time_basis @ self._missing_coefficients.T  # (times, features)
+            missing = (1.0 - observed) * effect.T[None, :, :]
+        return temporal, static, pairs, missing
+
+    def missing_surface(self, feature_index: int, normalized_time_grid, return_interval: bool = False):
+        """The fitted "not measured" effect of one feature over (normalized) time."""
+        time_basis = basis_design(self.basis, np.asarray(normalized_time_grid, dtype=np.float32),
+                                  self._time_basis_a, self._time_basis_b)
+        surfaces = np.stack([time_basis @ bag[feature_index] for bag in self._bagged_missing_coefficients])
+        return percentile_band(surfaces) if return_interval else surfaces.mean(axis=0)
 
     def interaction_surface(self, pair_index: int, u_values, w_values, return_interval: bool = False):
         """Pair surface on a grid of raw values: ``(len(u_values), len(w_values))``."""

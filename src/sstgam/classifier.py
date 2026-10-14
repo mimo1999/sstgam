@@ -26,16 +26,19 @@ class Explanation(NamedTuple):
     """Per-row additive breakdown of the linear predictor (log-odds for ``SSTGAM``).
 
     ``intercept + temporal.sum(axis=(1, 2)) + static.sum(axis=1) +
-    pairs.sum(axis=1)`` equals ``decision_function(X)``. ``temporal[i, k, t]``
-    is what row ``i``'s value of ``temporal_features_[k]`` at ``time_ids_[t]``
-    adds (0 when missing); ``static[i, s]`` is what ``static_features_[s]``
-    adds; ``pairs[i, j]`` is what interaction ``interaction_terms_[j]`` adds.
+    pairs.sum(axis=1) + missing.sum(axis=(1, 2))`` equals ``decision_function(X)``.
+    ``temporal[i, k, t]`` is what row ``i``'s value of ``temporal_features_[k]``
+    at ``time_ids_[t]`` adds (0 when missing); ``static[i, s]`` is what
+    ``static_features_[s]`` adds; ``pairs[i, j]`` is what interaction
+    ``interaction_terms_[j]`` adds; ``missing[i, k, t]`` is what *not* measuring
+    feature ``k`` at time ``t`` adds (all zero unless ``missing_effects=True``).
     """
 
     intercept: float
     temporal: np.ndarray
     static: np.ndarray
     pairs: np.ndarray
+    missing: np.ndarray
 
 
 class _SSTGAMBase(BaseEstimator):
@@ -65,6 +68,7 @@ class _SSTGAMBase(BaseEstimator):
         interactions: int | Iterable[tuple[str, str]] = 0,
         n_pair_bases: int = 6,
         penalty_sharing: str = "per_term",
+        missing_effects: bool = False,
         bag_validation: str = "fixed",
         min_leaf_hessian: float | None = None,
         max_leaves: int | None = None,
@@ -90,6 +94,7 @@ class _SSTGAMBase(BaseEstimator):
         self.interactions = interactions
         self.n_pair_bases = n_pair_bases
         self.penalty_sharing = penalty_sharing
+        self.missing_effects = missing_effects
         self.bag_validation = bag_validation
         self.min_leaf_hessian = min_leaf_hessian
         self.max_leaves = max_leaves
@@ -230,6 +235,9 @@ class _SSTGAMBase(BaseEstimator):
 
         values, observed, static_values = self._build_tensors(matrix)
         self._validate_hyperparameters()
+        if self.missing_effects and self.include_missingness_indicators:
+            warnings.warn("missing_effects and include_missingness_indicators both encode how often features are "
+                          "measured; missing_effects alone is usually enough.", stacklevel=3)
         pairs, n_interactions = self._candidate_pairs()
         self.model_ = self._make_trainer().fit(
             values, observed, static_values,
@@ -247,6 +255,9 @@ class _SSTGAMBase(BaseEstimator):
                             for index, name in enumerate(self.static_features_)})
         importances.update({f"{u} x {w}": float(np.abs(explanation.pairs[:, index]).mean())
                             for index, (u, w) in enumerate(self.interaction_terms_)})
+        if self.missing_effects:
+            importances.update({f"{name} [not measured]": float(np.abs(explanation.missing[:, index].sum(axis=1)).mean())
+                                for index, name in enumerate(self.temporal_features_)})
         self.term_importances_ = dict(sorted(importances.items(), key=lambda item: -item[1]))
 
     def _axis(self, name: str):
@@ -260,6 +271,8 @@ class _SSTGAMBase(BaseEstimator):
     def _term_name(self, kind: str, index: int) -> str:
         if kind == "pair":
             return " x ".join(self._axis_name(axis) for axis in self.model_._pairs[index])
+        if kind == "missing":
+            return f"{self.temporal_features_[index]} [not measured]"
         return (self.temporal_features_ if kind == "temporal" else self.static_features_)[index]
 
     def _axis_name(self, axis) -> str:
@@ -281,8 +294,8 @@ class _SSTGAMBase(BaseEstimator):
         return pairs, len(pairs)
 
     def _explain_matrix(self, matrix: np.ndarray) -> Explanation:
-        temporal, static, pairs = self.model_.contributions(*self._build_tensors(matrix))
-        return Explanation(self.model_._intercept, temporal, static, pairs)
+        temporal, static, pairs, missing = self.model_.contributions(*self._build_tensors(matrix))
+        return Explanation(self.model_._intercept, temporal, static, pairs, missing)
 
     def explain(self, X) -> Explanation:
         """Break each row's prediction into the intercept plus one term per observed cell and static column.
@@ -298,7 +311,7 @@ class _SSTGAMBase(BaseEstimator):
         """Linear predictor per row (log-odds for ``SSTGAM``): the sum of ``explain(X)``."""
         explanation = self.explain(X)
         return (explanation.intercept + explanation.temporal.sum(axis=(1, 2)) + explanation.static.sum(axis=1)
-                + explanation.pairs.sum(axis=1))
+                + explanation.pairs.sum(axis=1) + explanation.missing.sum(axis=(1, 2)))
 
     def _validate_hyperparameters(self) -> None:
         if self.method not in {"spline", "tree"}:
@@ -348,6 +361,7 @@ class _SSTGAMBase(BaseEstimator):
                 bag_validation=self.bag_validation,
                 min_leaf_hessian=self.min_leaf_hessian,
                 max_leaves=self.max_leaves,
+                missing_effects=self.missing_effects,
             )
         return SharedShapeTemporalGAMBoost(
             n_value_bases=self.n_value_bases,
@@ -364,6 +378,7 @@ class _SSTGAMBase(BaseEstimator):
             n_pair_bases=self.n_pair_bases,
             n_pair_bins=self.n_value_bins,
             penalty_sharing=self.penalty_sharing,
+            missing_effects=self.missing_effects,
         )
 
     def _temporal_index(self, feature: str) -> int:
@@ -447,6 +462,25 @@ class _SSTGAMBase(BaseEstimator):
         if not swap:
             return result
         return tuple(part.T for part in result) if return_interval else result.T
+
+    def missing_surface(self, feature: str, time_coordinates, return_interval: bool = False) -> _Effect:
+        """The fitted effect of *not* measuring ``feature`` at each of ``time_coordinates`` (link scale).
+
+        Needs ``missing_effects=True``. The spline method accepts any time
+        coordinate; the tree method only the fitted ``time_ids_``. Effects are
+        centred over the training rows.
+        """
+        if not self.missing_effects:
+            raise ValueError("missing_surface needs missing_effects=True.")
+        index = self._temporal_index(feature)
+        times = np.atleast_1d(time_coordinates)
+        if self.method == "spline":
+            return self.model_.missing_surface(index, self.model_.normalize_time(times), return_interval=return_interval)
+        unknown = [t for t in times.tolist() if t not in self.time_ids_]
+        if unknown:
+            raise ValueError(f"The tree method has missing effects only at the fitted time ids; got {unknown}")
+        positions = [self.time_ids_.index(t) for t in times.tolist()]
+        return self.model_.missing_surface(index, positions, return_interval=return_interval)
 
     def value_time_table(self, feature: str, return_interval: bool = False) -> tuple[np.ndarray, ...]:
         """Return the tree backend's fitted value-bin by time-bin table.
@@ -556,6 +590,14 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
     n_pair_bases : int, default=6
         Bases per axis of each spline interaction surface. Tree interactions
         reuse their two terms' bins, and pair ranking uses ``n_value_bins``.
+    missing_effects : bool, default=False
+        Adds one term per temporal feature for the measurement process: a
+        smooth (spline) or binned (tree) effect over time of the feature *not*
+        being measured. Without it a missing cell adds nothing, which assumes
+        missingness carries no information; with it the model learns, for
+        example, that not checking a lab on a given day signals lower risk.
+        Inspect it with ``missing_surface``; ``explain(X).missing`` holds the
+        per-cell contributions.
     bag_validation : {"fixed", "per_bag"}, default="fixed"
         Tree method: one validation split shared by every bag, or a fresh
         split per bag (as EBM does), so the early-stopping points differ.
@@ -638,6 +680,7 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
         interactions: int | Iterable[tuple[str, str]] = 0,
         n_pair_bases: int = 6,
         penalty_sharing: str = "per_term",
+        missing_effects: bool = False,
         bag_validation: str = "fixed",
         min_leaf_hessian: float | None = None,
         max_leaves: int | None = None,
@@ -651,7 +694,8 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
             early_stopping_rounds=early_stopping_rounds,
             include_missingness_indicators=include_missingness_indicators, val_fraction=val_fraction,
             static_columns=static_columns, interactions=interactions, n_pair_bases=n_pair_bases,
-            penalty_sharing=penalty_sharing, bag_validation=bag_validation, min_leaf_hessian=min_leaf_hessian,
+            penalty_sharing=penalty_sharing, missing_effects=missing_effects, bag_validation=bag_validation,
+            min_leaf_hessian=min_leaf_hessian,
             max_leaves=max_leaves, random_state=random_state,
         )
         self.family = family

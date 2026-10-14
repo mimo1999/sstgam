@@ -413,3 +413,47 @@ def test_tree_per_bag_validation_and_leaf_limits(longitudinal_data):
     np.testing.assert_array_equal(single[0], single[1])  # one bag: the same split either way
     model = SSTGAM(outer_bags=3, bag_validation="per_bag", min_leaf_hessian=1.0, max_leaves=4, **settings).fit(X, y)
     assert np.isfinite(model.predict_proba(X)).all() and len(model.model_.best_rounds_) == 3
+
+
+def measurement_signal_data(n=3000, seed=0, times=6):
+    """Values are pure noise; sicker rows (y = 1) get measured more often on later days."""
+    generator = np.random.RandomState(seed)
+    target = (generator.rand(n) < 0.25).astype(int)
+    rate = np.where(target[:, None] == 1, np.linspace(0.5, 0.95, times), 0.5)
+    values = np.where(generator.rand(n, times) < rate, generator.normal(size=(n, times)), np.nan)
+    return pd.DataFrame(values, columns=[f"signal_{t}" for t in range(times)]), target
+
+
+@pytest.mark.parametrize("method", ["spline", "tree"])
+def test_missing_effects_learn_from_the_measurement_process(method):
+    X, y = measurement_signal_data()
+    X_test, y_test = measurement_signal_data(seed=1)
+    settings = {"method": method, "outer_bags": 1, "learning_rate": 0.1, "max_rounds": 200, "random_state": 0}
+    from sklearn.metrics import roc_auc_score
+    without = roc_auc_score(y_test, SSTGAM(**settings).fit(X, y).predict_proba(X_test)[:, 1])
+    model = SSTGAM(missing_effects=True, **settings).fit(X, y)
+    with_effects = roc_auc_score(y_test, model.predict_proba(X_test)[:, 1])
+    # the tree's value bins can already pick up the measurement pattern from missing cells, so only the
+    # spline must gain; neither may lose
+    assert with_effects > 0.7 and with_effects >= without - 0.01, (without, with_effects)
+    if method == "spline":
+        assert with_effects > without + 0.05, (without, with_effects)
+    effect = model.missing_surface("signal", [0, 5])
+    assert effect[1] < effect[0]  # not measured late = lower risk than not measured early
+    explanation = model.explain(X_test)
+    assert explanation.missing.shape == (len(X_test), 1, 6)
+    assert (explanation.missing[X_test.notna().to_numpy()[:, None, :]] == 0).all()
+    np.testing.assert_allclose(model.decision_function(X_test), explanation.intercept + explanation.temporal.sum(axis=(1, 2))
+                               + explanation.static.sum(axis=1) + explanation.pairs.sum(axis=1)
+                               + explanation.missing.sum(axis=(1, 2)), atol=1e-8)
+    assert "signal [not measured]" in model.term_importances_
+
+
+def test_missing_effects_with_reml_and_warning(longitudinal_data):
+    X, y = longitudinal_data
+    model = SSTGAM(missing_effects=True, temporal_penalty="reml", static_penalty="reml", outer_bags=1).fit(X, y)
+    assert set(model.smoothing_params_["signal [not measured]"]) == {"time", "shrink"}
+    with pytest.raises(ValueError, match="needs missing_effects=True"):
+        SSTGAM(outer_bags=1).fit(X, y).missing_surface("signal", [0])
+    with pytest.warns(UserWarning, match="missing_effects alone"):
+        SSTGAM(missing_effects=True, include_missingness_indicators=True, outer_bags=1).fit(X, y)

@@ -100,8 +100,10 @@ class SharedShapeTemporalGAMTreeBoost:
         bag_validation: str = "fixed",
         min_leaf_hessian: float | None = None,
         max_leaves: int | None = None,
+        missing_effects: bool = False,
     ) -> None:
         self.family = family
+        self.missing_effects = missing_effects
         self.bag_validation = bag_validation
         self.min_leaf_hessian = min_leaf_hessian
         self.max_leaves = max_leaves
@@ -319,6 +321,8 @@ class SharedShapeTemporalGAMTreeBoost:
         ]
         static_coordinates = [np.arange(len(edges) - 1, dtype=np.float64)[:, None]
                               for edges in self._static_edges]
+        # "not measured" tables are functions of time only, fitted like a static term over the time axis
+        missing_coordinates = normalized_time[:, None] if self.missing_effects else None
 
         # "fixed": one validation split, only the bootstrapped training rows vary by bag.
         # "per_bag": every bag draws its own validation split, as EBM does.
@@ -343,17 +347,20 @@ class SharedShapeTemporalGAMTreeBoost:
             bags = [
                 self._fit_one_bag(weights, target, observed, fit_indices, bag_validation_indices,
                                   n_value_bins, n_times, static_bins, temporal_coordinates,
-                                  temporal_cell_ids, static_coordinates, rng, start, pair_data)
+                                  temporal_cell_ids, static_coordinates, rng, start, pair_data,
+                                  missing_coordinates)
                 for fit_indices, bag_validation_indices in bag_rows()
             ]
-            self._bagged_feature_tables = [feature_tables for _, (feature_tables, _, _), _ in bags]
-            self._bagged_static_tables = [static_tables for _, (_, static_tables, _), _ in bags]
-            self._bagged_pair_tables = [pair_tables for _, (_, _, pair_tables), _ in bags]
+            self._bagged_feature_tables = [feature_tables for _, (feature_tables, _, _, _), _ in bags]
+            self._bagged_static_tables = [static_tables for _, (_, static_tables, _, _), _ in bags]
+            self._bagged_pair_tables = [pair_tables for _, (_, _, pair_tables, _), _ in bags]
+            self._bagged_missing_tables = [missing_tables for _, (_, _, _, missing_tables), _ in bags]
             self.best_rounds_ = [best_round for _, _, best_round in bags]
             self._intercept = float(np.mean([intercept for intercept, _, _ in bags]))
             self._feature_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_feature_tables)]
             self._static_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_static_tables)]
             self._pair_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_pair_tables)]
+            self._missing_tables = [np.mean(tables, axis=0) for tables in zip(*self._bagged_missing_tables)]
 
         fit_bags()
         if n_interactions and pairs:
@@ -366,18 +373,22 @@ class SharedShapeTemporalGAMTreeBoost:
                 pairs, pair_data = [pairs[i] for i in keep], [pair_data[i] for i in keep]
             self._pairs, self._pair_shapes = list(pairs), [(n_u, n_w) for _, _, n_u, n_w in pair_data]
             fit_bags(start=(self._intercept, [table.copy() for table in self._feature_tables],
-                            [table.copy() for table in self._static_tables], score), pair_data=pair_data)
+                            [table.copy() for table in self._static_tables], score,
+                            [table.copy() for table in self._missing_tables]), pair_data=pair_data)
         return self
 
     def _fit_one_bag(self, weights, target, observed, fit_indices, validation_indices,
                      n_value_bins, n_times, static_bins, temporal_coordinates,
-                     temporal_cell_ids, static_coordinates, rng, start=None, pair_data=()):
+                     temporal_cell_ids, static_coordinates, rng, start=None, pair_data=(),
+                     missing_coordinates=None):
         if start is None:
             feature_tables = [np.zeros(bin_count * n_times) for bin_count in n_value_bins]
             static_tables = [np.zeros(len(edges) - 1) for edges in self._static_edges]
+            missing_tables = ([np.zeros(n_times) for _ in n_value_bins] if missing_coordinates is not None else [])
         else:
             feature_tables = [table.copy() for table in start[1]]
             static_tables = [table.copy() for table in start[2]]
+            missing_tables = [table.copy() for table in start[4]]
         pair_tables = [np.zeros(n_u * n_w) for _, _, n_u, n_w in pair_data]
         pair_coordinates = [np.column_stack((np.repeat(np.arange(n_u), n_w), np.tile(np.arange(n_w), n_u)))
                             .astype(np.float64) for _, _, n_u, n_w in pair_data]
@@ -402,6 +413,17 @@ class SharedShapeTemporalGAMTreeBoost:
                 fit_score += (update[fit_cells[feature_index]] * fit_observed[:, feature_index, :]).sum(axis=1)
                 validation_score += (update[validation_cells[feature_index]] *
                                      validation_observed[:, feature_index, :]).sum(axis=1)
+
+            for feature_index, table in enumerate(missing_tables):
+                gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
+                fit_missing = 1.0 - fit_observed[:, feature_index, :]
+                update = self._tree_update(missing_coordinates, gradient @ fit_missing, hessian @ fit_missing, rng)
+                if update is None:
+                    continue
+                update *= self.learning_rate
+                table += update
+                fit_score += fit_missing @ update
+                validation_score += (1.0 - validation_observed[:, feature_index, :]) @ update
 
             for column_index, table in enumerate(static_tables):
                 gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
@@ -434,7 +456,7 @@ class SharedShapeTemporalGAMTreeBoost:
 
         def snapshot():
             return ([table.copy() for table in feature_tables], [table.copy() for table in static_tables],
-                    [table.copy() for table in pair_tables])
+                    [table.copy() for table in pair_tables], [table.copy() for table in missing_tables])
 
         return boost_bag(FAMILIES[self.family], update_terms, snapshot, fit_target, fit_weight,
                          target[validation_indices], weights[validation_indices],
@@ -443,9 +465,11 @@ class SharedShapeTemporalGAMTreeBoost:
                                                            start[3][validation_indices]))
 
     def contributions(self, values, observed, static_values):
-        """Per-cell temporal ``(n, features, times)`` and per-column static ``(n, statics)`` terms.
+        """Per-cell temporal, per-column static, per-pair and per-cell "not measured" terms.
 
-        Together with ``_intercept`` they sum to the linear predictor; missing cells contribute 0.
+        Shapes ``(n, features, times)``, ``(n, statics)``, ``(n, pairs)`` and ``(n, features, times)``; with
+        ``_intercept`` they sum to the linear predictor. A missing cell adds nothing to ``temporal``; with
+        ``missing_effects`` it adds its "not measured" effect to the last array instead.
         """
         values = np.asarray(values, dtype=np.float32)
         observed = np.asarray(observed, dtype=np.float64)
@@ -461,7 +485,16 @@ class SharedShapeTemporalGAMTreeBoost:
         for pair_index, pair in enumerate(self._pairs):
             cells, mask, _, _ = self._pair_bins(values, observed, static_values, pair)
             pairs[:, pair_index] = (self._pair_tables[pair_index][cells] * mask).sum(axis=1)
-        return temporal, static, pairs
+        missing = np.zeros(values.shape, dtype=np.float64)
+        for feature_index, table in enumerate(self._missing_tables):
+            missing[:, feature_index, :] = (1.0 - observed[:, feature_index, :]) * table[None, :]
+        return temporal, static, pairs, missing
+
+    def missing_surface(self, feature_index: int, time_positions, return_interval: bool = False):
+        """The fitted "not measured" effect of one feature at the given time positions (indices of the time ids)."""
+        positions = np.asarray(time_positions, dtype=int)
+        tables = np.stack([bag[feature_index][positions] for bag in self._bagged_missing_tables])
+        return percentile_band(tables) if return_interval else self._missing_tables[feature_index][positions]
 
     def interaction_surface(self, pair_index: int, u_values, w_values, return_interval: bool = False):
         """Pair table looked up on a grid of raw values: ``(len(u_values), len(w_values))``."""
