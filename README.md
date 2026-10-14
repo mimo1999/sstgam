@@ -47,7 +47,9 @@ use pandas, which is optional (`pip install pandas`).
 `<feature_name>_<time_id>`, where `time_id` is a non-negative number such as
 `6` or `0.5`. Time ids are placed at their actual distances, so uneven
 spacing (days 0, 3, 7, 14) is fine; every row shares the same set of time
-columns. All other columns are treated as static covariates.
+columns (see [Irregular timestamps](#irregular-timestamps) when each patient
+is measured at their own times). All other columns are treated as static
+covariates.
 
 When fitting a NumPy array instead of a DataFrame, pass the matching column
 names explicitly through `feature_names`; without names `fit` raises an error.
@@ -102,6 +104,40 @@ regressor = SSTGAMRegressor(family="poisson")  # or "gaussian" (the default)
 regressor.fit(X_train, [0, 2, 1, 5])
 expected_count = regressor.predict(X_train)
 ```
+
+## Irregular timestamps
+
+When each patient is measured at their own times, keep the data long (one row
+per measurement) and let `bin_timestamps` put it on a shared grid. It needs
+pandas.
+
+```python
+from sstgam import bin_timestamps
+
+observations = pd.DataFrame({
+    "patient": [1, 1, 1, 2, 2],
+    "hour":    [0.5, 3.0, 13.0, 2.0, 30.0],
+    "lab":     ["lactate", "lactate", "lactate", "lactate", "urea"],
+    "value":   [1.8, 2.4, 1.1, 3.0, 7.5],
+})
+wide = bin_timestamps(observations, id_col="patient", time_col="hour", feature_col="lab",
+                      value_col="value", bin_width=12, n_bins=3)
+# columns lactate_0, lactate_12, lactate_24, urea_0, urea_12, urea_24; one row per patient
+```
+
+- Time zero is each patient's first measurement (`origin="first"`). Use
+  `origin="absolute"` for the raw clock, or pass a Series of per-patient start
+  times such as admission.
+- Measurements in the same bin are averaged (`agg="mean"`); any pandas
+  aggregation works, e.g. `"last"` or `"max"`.
+- Bins with no measurement are NaN, which the model treats as missing.
+- `counts=True` adds `<feature>_n_<bin>` columns with the number of
+  measurements per bin, for when measurement frequency carries signal.
+- The bins depend only on the arguments, so binning test data with the same
+  arguments gives the same columns. Join static covariates by patient id.
+
+Datetime times work with a `pd.Timedelta` bin width; the columns are then
+numbered by bin.
 
 ## Interpreting outputs
 
@@ -175,6 +211,10 @@ logit(p_i) = intercept
 one-dimensional static effect. This is an additive time-varying model: it
 does not directly model lags, slopes, or interactions between successive
 measurements. Supply those as input features if they are needed.
+
+Pairwise interaction terms between features (as in EBM/GA2M) are currently
+disabled: every feature contributes on its own. They are planned for a later
+release.
 
 The spline method is a penalized GAM solved directly by P-IRLS, with the
 smoothness penalty chosen on held-out data. The tree method is fitted by
