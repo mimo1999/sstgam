@@ -64,6 +64,10 @@ class _SSTGAMBase(BaseEstimator):
         static_columns: Iterable[str] | None = None,
         interactions: int | Iterable[tuple[str, str]] = 0,
         n_pair_bases: int = 6,
+        penalty_sharing: str = "per_term",
+        bag_validation: str = "fixed",
+        min_leaf_hessian: float | None = None,
+        max_leaves: int | None = None,
         random_state: int = 42,
     ) -> None:
         self.method = method
@@ -85,6 +89,10 @@ class _SSTGAMBase(BaseEstimator):
         self.static_columns = static_columns
         self.interactions = interactions
         self.n_pair_bases = n_pair_bases
+        self.penalty_sharing = penalty_sharing
+        self.bag_validation = bag_validation
+        self.min_leaf_hessian = min_leaf_hessian
+        self.max_leaves = max_leaves
         self.random_state = random_state
 
     def _parse_columns(self, column_names: list[str]):
@@ -229,6 +237,9 @@ class _SSTGAMBase(BaseEstimator):
             sample_weight=sample_weight, pairs=pairs, n_interactions=n_interactions,
         )
         self.interaction_terms_ = [(self._axis_name(u), self._axis_name(w)) for u, w in self.model_._pairs]
+        self.smoothing_params_ = {self._term_name(kind, index): values
+                                  for kind, index, values in getattr(self.model_, "smoothing_params_", [])}
+        self.edf_ = {self._term_name(kind, index): value for kind, index, value in getattr(self.model_, "edf_", [])}
         explanation = self._explain_matrix(matrix)
         importances = {name: float(np.abs(explanation.temporal[:, index].sum(axis=1)).mean())
                        for index, name in enumerate(self.temporal_features_)}
@@ -245,6 +256,11 @@ class _SSTGAMBase(BaseEstimator):
             return ("static", self.static_features_.index(name))
         raise ValueError(f"Unknown feature {name!r} in interactions; fitted features: "
                          f"{self.temporal_features_ + self.static_features_}")
+
+    def _term_name(self, kind: str, index: int) -> str:
+        if kind == "pair":
+            return " x ".join(self._axis_name(axis) for axis in self.model_._pairs[index])
+        return (self.temporal_features_ if kind == "temporal" else self.static_features_)[index]
 
     def _axis_name(self, axis) -> str:
         kind, index = axis
@@ -296,8 +312,18 @@ class _SSTGAMBase(BaseEstimator):
             raise ValueError("Basis counts, bin count, and tree_depth must be positive.")
         for name in ("temporal_penalty", "static_penalty"):
             value = getattr(self, name)
-            if value != "auto" and (isinstance(value, str) or value <= 0):
-                raise ValueError(f"{name} must be 'auto' or a positive number, got {value!r}")
+            if value not in ("auto", "reml") and (isinstance(value, str) or value <= 0):
+                raise ValueError(f"{name} must be 'auto', 'reml' or a positive number, got {value!r}")
+        if {self.temporal_penalty, self.static_penalty} == {"auto", "reml"}:
+            raise ValueError("temporal_penalty and static_penalty cannot mix 'auto' and 'reml'.")
+        if self.penalty_sharing not in {"per_term", "shared"}:
+            raise ValueError(f"penalty_sharing must be 'per_term' or 'shared', got {self.penalty_sharing!r}")
+        if self.bag_validation not in {"fixed", "per_bag"}:
+            raise ValueError(f"bag_validation must be 'fixed' or 'per_bag', got {self.bag_validation!r}")
+        if self.min_leaf_hessian is not None and self.min_leaf_hessian < 0:
+            raise ValueError("min_leaf_hessian must be non-negative.")
+        if self.max_leaves is not None and self.max_leaves < 2:
+            raise ValueError("max_leaves must be at least 2.")
         if self.learning_rate <= 0:
             raise ValueError("learning_rate must be positive.")
         if self.max_rounds < 1 or self.early_stopping_rounds < 1 or self.outer_bags < 1:
@@ -319,6 +345,9 @@ class _SSTGAMBase(BaseEstimator):
                 val_fraction=self.val_fraction,
                 random_state=self.random_state,
                 family=self._family,
+                bag_validation=self.bag_validation,
+                min_leaf_hessian=self.min_leaf_hessian,
+                max_leaves=self.max_leaves,
             )
         return SharedShapeTemporalGAMBoost(
             n_value_bases=self.n_value_bases,
@@ -334,6 +363,7 @@ class _SSTGAMBase(BaseEstimator):
             family=self._family,
             n_pair_bases=self.n_pair_bases,
             n_pair_bins=self.n_value_bins,
+            penalty_sharing=self.penalty_sharing,
         )
 
     def _temporal_index(self, feature: str) -> int:
@@ -465,7 +495,7 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
     value_transform : {"quantile", "zscore"}, default="quantile"
         Per-feature value normalization for the spline method, applied to
         temporal values and static covariates alike.
-    temporal_penalty, static_penalty : float or "auto", default="auto"
+    temporal_penalty, static_penalty : float, "auto" or "reml", default="auto"
         Smoothness penalties for spline temporal and static effects. The
         right value depends on how much information each coefficient gets
         and differs by orders of magnitude between datasets. With
@@ -477,7 +507,19 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
         split holds at least 500 minority-class examples, otherwise from
         5-fold cross-validation, which is slower but stable on small data. The chosen values are on ``model_`` as
         ``temporal_penalty_`` / ``static_penalty_``, and every value tried
-        with its validation loss as ``penalty_search_``.
+        with its validation loss as ``penalty_search_``. With ``"reml"``,
+        every penalty piece of every term gets its own smoothing parameter
+        (value-axis roughness, time-axis roughness and overall size for a
+        surface; roughness and size for a static effect), chosen by REML with
+        the generalised Fellner-Schall update, without cross-validation. The
+        chosen values are in ``smoothing_params_`` and the effective degrees
+        of freedom per term in ``edf_``. A number for one of the two fixes that
+        group's pieces while the other is tuned; ``"auto"`` and ``"reml"``
+        cannot be mixed.
+    penalty_sharing : {"per_term", "shared"}, default="per_term"
+        Under ``"reml"``: one smoothing parameter per piece of every term, or
+        one per piece type shared by all terms of a kind (fewer parameters, for
+        very small data).
     val_fraction : float, default=0.15
         Held-out fraction: the tree method's early-stopping split, and the
         spline method's ``"auto"`` penalty search.
@@ -514,6 +556,12 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
     n_pair_bases : int, default=6
         Bases per axis of each spline interaction surface. Tree interactions
         reuse their two terms' bins, and pair ranking uses ``n_value_bins``.
+    bag_validation : {"fixed", "per_bag"}, default="fixed"
+        Tree method: one validation split shared by every bag, or a fresh
+        split per bag (as EBM does), so the early-stopping points differ.
+    min_leaf_hessian, max_leaves : optional
+        Tree method: the smallest total curvature a leaf may hold, and the
+        largest number of leaves per tree update.
     random_state
         Random seed (validation split, bootstrap bags, tree fitting).
 
@@ -529,6 +577,10 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
         Mean absolute log-odds contribution of each term over the training
         rows, largest first (the temporal terms summed over time per row;
         interactions named ``"a x b"``).
+    smoothing_params_, edf_ : dict
+        With ``"reml"`` penalties: the chosen smoothing parameter of each
+        penalty piece, and the effective degrees of freedom, per term name.
+        Empty otherwise.
     """
 
     def fit(self, X, y, feature_names: Iterable[str] | None = None, sample_weight=None) -> "SSTGAM":
@@ -585,6 +637,10 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
         static_columns: Iterable[str] | None = None,
         interactions: int | Iterable[tuple[str, str]] = 0,
         n_pair_bases: int = 6,
+        penalty_sharing: str = "per_term",
+        bag_validation: str = "fixed",
+        min_leaf_hessian: float | None = None,
+        max_leaves: int | None = None,
         random_state: int = 42,
     ) -> None:
         super().__init__(
@@ -595,7 +651,8 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
             early_stopping_rounds=early_stopping_rounds,
             include_missingness_indicators=include_missingness_indicators, val_fraction=val_fraction,
             static_columns=static_columns, interactions=interactions, n_pair_bases=n_pair_bases,
-            random_state=random_state,
+            penalty_sharing=penalty_sharing, bag_validation=bag_validation, min_leaf_hessian=min_leaf_hessian,
+            max_leaves=max_leaves, random_state=random_state,
         )
         self.family = family
 

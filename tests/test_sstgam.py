@@ -232,7 +232,7 @@ def test_explicit_penalty_skips_the_search(longitudinal_data):
     assert backend.temporal_penalty_ == 3.0 and backend.penalty_search_
     backend = SSTGAM(method="spline", temporal_penalty=3.0, static_penalty=2.0, outer_bags=1).fit(X, y).model_
     assert (backend.temporal_penalty_, backend.static_penalty_) == (3.0, 2.0) and not backend.penalty_search_
-    with pytest.raises(ValueError, match="temporal_penalty must be 'auto' or a positive number"):
+    with pytest.raises(ValueError, match="temporal_penalty must be 'auto', 'reml' or a positive number"):
         SSTGAM(temporal_penalty="smooth").fit(X, y)
 
 
@@ -367,3 +367,49 @@ def test_explicit_interaction_list(longitudinal_data):
         model.interaction_surface("signal", "signal", [0.0], [0.0])
     with pytest.raises(ValueError, match="Unknown feature"):
         SSTGAM(interactions=[("signal", "missing")]).fit(X, y)
+
+
+def surface_data(n, kind, seed=0, times=8):
+    """One signal whose effect depends only on time ("time") or only on the value ("value")."""
+    generator = np.random.RandomState(seed)
+    values = generator.normal(size=(n, times))
+    tau = np.linspace(0.0, 1.0, times)
+    effect = 0.25 * np.sin(2 * np.pi * tau)[None, :] + 0.0 * values if kind == "time" else 0.35 * np.tanh(2 * values)
+    score = -1.0 + effect.sum(axis=1)
+    target = (generator.rand(n) < 1 / (1 + np.exp(-score))).astype(int)
+    return pd.DataFrame(values, columns=[f"signal_{t}" for t in range(times)]), target
+
+
+def test_reml_selects_per_axis_smoothing():
+    for kind, rougher in (("time", "time"), ("value", "value")):
+        X, y = surface_data(6000, kind)
+        model = SSTGAM(temporal_penalty="reml", static_penalty="reml", outer_bags=1).fit(X, y)
+        smoothing = model.smoothing_params_["signal"]
+        assert set(smoothing) == {"value", "time", "shrink"}
+        smoother = "value" if rougher == "time" else "time"
+        # The axis the effect varies along needs less smoothing than the flat one.
+        assert smoothing[rougher] < smoothing[smoother], (kind, smoothing)
+        assert 0 < model.edf_["signal"] < 40
+
+
+def test_reml_fits_with_statics_pairs_and_sharing(longitudinal_data):
+    X, y = longitudinal_data
+    for sharing in ("per_term", "shared"):
+        model = SSTGAM(temporal_penalty="reml", static_penalty="reml", penalty_sharing=sharing, outer_bags=2,
+                       interactions=1).fit(X, y)
+        assert np.isfinite(model.predict_proba(X)).all()
+        assert set(model.smoothing_params_) >= {"signal", "context", "signal x context"}
+        assert set(model.smoothing_params_["context"]) == {"value", "shrink"}
+    fixed = SSTGAM(temporal_penalty="reml", static_penalty=5.0, outer_bags=1).fit(X, y)
+    assert fixed.smoothing_params_["context"] == {"value": 5.0, "shrink": 5.0}
+    with pytest.raises(ValueError, match="cannot mix 'auto' and 'reml'"):
+        SSTGAM(temporal_penalty="reml", static_penalty="auto").fit(X, y)
+
+
+def test_tree_per_bag_validation_and_leaf_limits(longitudinal_data):
+    X, y = longitudinal_data
+    settings = {"method": "tree", "max_rounds": 12, "early_stopping_rounds": 4, "random_state": 0}
+    single = [SSTGAM(outer_bags=1, bag_validation=v, **settings).fit(X, y).predict_proba(X) for v in ("fixed", "per_bag")]
+    np.testing.assert_array_equal(single[0], single[1])  # one bag: the same split either way
+    model = SSTGAM(outer_bags=3, bag_validation="per_bag", min_leaf_hessian=1.0, max_leaves=4, **settings).fit(X, y)
+    assert np.isfinite(model.predict_proba(X)).all() and len(model.model_.best_rounds_) == 3

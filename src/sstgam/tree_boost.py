@@ -97,8 +97,14 @@ class SharedShapeTemporalGAMTreeBoost:
         val_fraction: float = 0.15,
         random_state: int = 42,
         family: str = "binomial",
+        bag_validation: str = "fixed",
+        min_leaf_hessian: float | None = None,
+        max_leaves: int | None = None,
     ) -> None:
         self.family = family
+        self.bag_validation = bag_validation
+        self.min_leaf_hessian = min_leaf_hessian
+        self.max_leaves = max_leaves
         self.n_value_bins = n_value_bins
         self.max_depth = max_depth
         self.learning_rate = learning_rate
@@ -146,6 +152,15 @@ class SharedShapeTemporalGAMTreeBoost:
             return self._static_tables[column_index][bins]
         return percentile_band(np.stack([tables[column_index][bins] for tables in self._bagged_static_tables]))
 
+    def _leaf_limits(self, hessian_total: float) -> dict:
+        """Optional leaf constraints for the regression trees (none by default)."""
+        limits = {}
+        if self.min_leaf_hessian:
+            limits["min_weight_fraction_leaf"] = min(0.5, self.min_leaf_hessian / max(hessian_total, 1e-12))
+        if self.max_leaves:
+            limits["max_leaf_nodes"] = self.max_leaves
+        return limits
+
     def _tree_update(self, coordinates, gradient_sum, hessian_sum, rng):
         """Plain single-stage tree update -- used for 1-D (static) terms."""
         active = hessian_sum > _MIN_HESSIAN
@@ -155,6 +170,7 @@ class SharedShapeTemporalGAMTreeBoost:
         tree = DecisionTreeRegressor(
             max_depth=self.max_depth,
             random_state=rng.randint(0, 2**31 - 1),
+            **self._leaf_limits(hessian_sum[active].sum()),
         )
         tree.fit(coordinates[active], targets, sample_weight=hessian_sum[active])
         return tree.predict(coordinates)
@@ -181,6 +197,7 @@ class SharedShapeTemporalGAMTreeBoost:
         targets = np.divide(gradient_sum, hessian_sum,
                             out=np.zeros_like(gradient_sum), where=hessian_sum > 0)
         value_column, time_column = coordinates[:, 0:1], coordinates[:, 1:2]
+        limits = self._leaf_limits(hessian_sum[active].sum())
 
         def fit_depth1(column):
             candidate_count = max(len(np.unique(column[active])), 2)
@@ -206,7 +223,8 @@ class SharedShapeTemporalGAMTreeBoost:
             # Reuse the depth-1 candidate tree instead of refitting it.
             first_tree = candidate_tree
         else:
-            first_tree = DecisionTreeRegressor(max_depth=first_depth, random_state=rng.randint(0, 2**31 - 1))
+            first_tree = DecisionTreeRegressor(max_depth=first_depth, random_state=rng.randint(0, 2**31 - 1),
+                                               **limits)
             first_tree.fit(first_column[active], targets[active], sample_weight=hessian_sum[active])
         groups = first_tree.apply(first_column)
         prediction = first_tree.predict(first_column)
@@ -217,7 +235,8 @@ class SharedShapeTemporalGAMTreeBoost:
             group_active = mask & active
             if group_active.sum() < 2:
                 continue
-            second_tree = DecisionTreeRegressor(max_depth=second_depth, random_state=rng.randint(0, 2**31 - 1))
+            second_tree = DecisionTreeRegressor(max_depth=second_depth, random_state=rng.randint(0, 2**31 - 1),
+                                                **limits)
             second_tree.fit(second_column[group_active], targets[group_active], sample_weight=hessian_sum[group_active])
             update[mask] = second_tree.predict(second_column[mask])
         return update
@@ -301,7 +320,8 @@ class SharedShapeTemporalGAMTreeBoost:
         static_coordinates = [np.arange(len(edges) - 1, dtype=np.float64)[:, None]
                               for edges in self._static_edges]
 
-        # Fixed validation split; only the bootstrapped training rows vary by bag.
+        # "fixed": one validation split, only the bootstrapped training rows vary by bag.
+        # "per_bag": every bag draws its own validation split, as EBM does.
         train_indices, validation_indices = make_validation_split(
             target, self.val_fraction, self.random_state
         )
@@ -309,12 +329,22 @@ class SharedShapeTemporalGAMTreeBoost:
         rng = np.random.RandomState(self.random_state)
         self._pairs, self._pair_shapes = [], []
 
+        def bag_rows():
+            if self.bag_validation == "fixed":
+                for fit_indices in bootstrap_bags(train_indices, self.outer_bags, rng):
+                    yield fit_indices, validation_indices
+                return
+            for bag in range(self.outer_bags):
+                bag_train, bag_validation = make_validation_split(target, self.val_fraction, self.random_state + bag)
+                yield (bag_train if self.outer_bags == 1
+                       else rng.choice(bag_train, size=bag_train.size, replace=True)), bag_validation
+
         def fit_bags(start=None, pair_data=()):
             bags = [
-                self._fit_one_bag(weights, target, observed, fit_indices, validation_indices,
+                self._fit_one_bag(weights, target, observed, fit_indices, bag_validation_indices,
                                   n_value_bins, n_times, static_bins, temporal_coordinates,
                                   temporal_cell_ids, static_coordinates, rng, start, pair_data)
-                for fit_indices in bootstrap_bags(train_indices, self.outer_bags, rng)
+                for fit_indices, bag_validation_indices in bag_rows()
             ]
             self._bagged_feature_tables = [feature_tables for _, (feature_tables, _, _), _ in bags]
             self._bagged_static_tables = [static_tables for _, (_, static_tables, _), _ in bags]
