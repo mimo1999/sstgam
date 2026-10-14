@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 from scipy.linalg import block_diag
 from sklearn.model_selection import KFold, StratifiedKFold
@@ -41,6 +43,37 @@ _AUTO_PENALTY_CV_FOLDS = 5
 
 def _row_chunks(n_rows: int):
     return (slice(start, min(start + _CHUNK_ROWS, n_rows)) for start in range(0, n_rows, _CHUNK_ROWS))
+
+
+@dataclass
+class _Term:
+    """One smooth term of the joint design: its columns, centring basis and penalty pieces.
+
+    ``design`` holds the term's columns in centred coordinates ``theta``; ``basis`` maps ``theta`` to
+    the uncentred coefficients (``basis @ theta``). ``pieces`` are the penalty matrices in uncentred
+    coordinates, one smoothing parameter each; ``group`` names the shared strength ("temporal" or
+    "static") the term uses when the pieces are not tuned separately. A pair term also keeps its two
+    axis bases in ``factors`` so its coefficients unpack to a ``(p_u, p_w)`` matrix.
+    """
+
+    kind: str
+    index: int
+    design: np.ndarray
+    basis: np.ndarray
+    pieces: list[tuple[str, np.ndarray]]
+    group: str
+    factors: tuple[np.ndarray, np.ndarray] | None = None
+
+    def penalty(self, strength: float) -> np.ndarray:
+        """Centred penalty with one strength on every piece, plus the tiny ridge every block gets."""
+        total = sum(piece for _, piece in self.pieces)
+        return self.basis.T @ (strength * total + _RIDGE * np.eye(self.basis.shape[0])) @ self.basis
+
+    def uncenter(self, theta: np.ndarray) -> np.ndarray:
+        if self.factors is None:
+            return self.basis @ theta
+        u_z, w_z = self.factors
+        return u_z @ theta.reshape(u_z.shape[1], -1) @ w_z.T
 
 
 class SharedShapeTemporalGAMBoost:
@@ -96,22 +129,18 @@ class SharedShapeTemporalGAMBoost:
         self.clip = _NORMALIZATION_CLIP
 
     @staticmethod
-    def _penalty_matrix(n_value_bases: int, n_time_bases: int,
-                        strength: float) -> np.ndarray:
-        value_difference = second_diff_matrix_np(n_value_bases)
-        time_difference = second_diff_matrix_np(n_time_bases)
-        value_penalty = value_difference.T @ value_difference
-        time_penalty = time_difference.T @ time_difference
-        return strength * (
-            np.kron(value_penalty, np.eye(n_time_bases)) +
-            np.kron(np.eye(n_value_bases), time_penalty) +
-            np.eye(n_value_bases * n_time_bases)
-        ) + _RIDGE * np.eye(n_value_bases * n_time_bases)
+    def _surface_pieces(n_first: int, n_second: int) -> list[tuple[str, np.ndarray]]:
+        """Penalty pieces of a tensor-product surface: roughness along each axis, and overall size."""
+        first_difference = second_diff_matrix_np(n_first)
+        second_difference = second_diff_matrix_np(n_second)
+        return [("value", np.kron(first_difference.T @ first_difference, np.eye(n_second))),
+                ("time", np.kron(np.eye(n_first), second_difference.T @ second_difference)),
+                ("shrink", np.eye(n_first * n_second))]
 
     @staticmethod
-    def _static_penalty(n_bases: int, strength: float) -> np.ndarray:
+    def _static_pieces(n_bases: int) -> list[tuple[str, np.ndarray]]:
         difference = second_diff_matrix_np(n_bases)
-        return strength * (difference.T @ difference) + _RIDGE * np.eye(n_bases)
+        return [("value", difference.T @ difference)]
 
     @staticmethod
     def _centering_basis(mean_row: np.ndarray) -> np.ndarray:
@@ -399,41 +428,37 @@ class SharedShapeTemporalGAMBoost:
                                         self._time_basis_a, self._time_basis_b)
 
         temporal_design, static_design = self._build_designs(values, observed, static_values)
-        # Fit in centred coordinates theta (c = Z @ theta), then map back.
+        # Every term is fitted in centred coordinates theta (coefficients = basis @ theta), then mapped back.
         observed_cells = np.maximum(observed.sum(axis=(0, 2)), 1.0)
-        temporal_bases = [self._centering_basis(temporal_design[:, k, :].sum(axis=0) / observed_cells[k])
-                          for k in range(n_features)]
-        temporal_design = np.stack([temporal_design[:, k, :] @ Z for k, Z in enumerate(temporal_bases)],
-                                   axis=1).astype(np.float32)
-        static_bases = []
+        surface_pieces = self._surface_pieces(self.n_value_bases, self.n_time_bases)
+        terms = []
+        for k in range(n_features):
+            basis = self._centering_basis(temporal_design[:, k, :].sum(axis=0) / observed_cells[k])
+            terms.append(_Term("temporal", k, (temporal_design[:, k, :] @ basis).astype(np.float32), basis,
+                               surface_pieces, "temporal"))
         if static_design is not None:
-            static_bases = [self._centering_basis(static_design[:, j, :].mean(axis=0)) for j in range(n_static)]
-            static_design = np.stack([static_design[:, j, :] @ Z for j, Z in enumerate(static_bases)],
-                                     axis=1).astype(np.float32)
+            static_pieces = self._static_pieces(self.n_static_bases)
+            for j in range(n_static):
+                basis = self._centering_basis(static_design[:, j, :].mean(axis=0))
+                terms.append(_Term("static", j, (static_design[:, j, :] @ basis).astype(np.float32), basis,
+                                   static_pieces, "static"))
 
-        def uncenter(theta, bases):
-            return None if theta is None else np.stack([Z @ t for Z, t in zip(bases, theta)])
+        def assemble(terms):
+            """One design over all terms (intercept first), and its penalty for the two shared strengths."""
+            design = np.concatenate([np.ones((n_samples, 1), dtype=np.float32), *(t.design for t in terms)], axis=1)
 
-        # One design over all terms: intercept, then each surface, then each static effect.
-        n_temporal = temporal_design.shape[2]
-        temporal_end = 1 + n_features * n_temporal
-        blocks = [np.ones((n_samples, 1), dtype=np.float32), temporal_design.reshape(n_samples, -1)]
-        if static_design is not None:
-            blocks.append(static_design.reshape(n_samples, -1))
-        design = np.concatenate(blocks, axis=1)
-
-        def penalty_at(temporal_strength, static_strength):
-            temporal = self._penalty_matrix(self.n_value_bases, self.n_time_bases, temporal_strength)
-            static = self._static_penalty(self.n_static_bases, static_strength)
-            # The intercept gets the same tiny ridge as every block: without it the Hessian is
-            # singular whenever the fitted probabilities saturate (e.g. a one-class bootstrap bag).
-            return block_diag(np.full((1, 1), _RIDGE), *(Z.T @ temporal @ Z for Z in temporal_bases),
-                              *(Z.T @ static @ Z for Z in static_bases))
+            def penalty_at(temporal_strength, static_strength):
+                # The intercept gets the same tiny ridge as every block: without it the Hessian is
+                # singular whenever the fitted probabilities saturate (e.g. a one-class bootstrap bag).
+                return block_diag(np.full((1, 1), _RIDGE), *(
+                    t.penalty(temporal_strength if t.group == "temporal" else static_strength) for t in terms))
+            return design, penalty_at
 
         def strengths(shared):
             return (shared if self.temporal_penalty == "auto" else self.temporal_penalty,
                     shared if self.static_penalty == "auto" else self.static_penalty)
 
+        design, penalty_at = assemble(terms)
         initial = None
         self.penalty_search_ = {}
         if "auto" in (self.temporal_penalty, self.static_penalty):
@@ -443,12 +468,11 @@ class SharedShapeTemporalGAMBoost:
             self.temporal_penalty_, self.static_penalty_ = strengths(shared)
         else:
             self.temporal_penalty_, self.static_penalty_ = self.temporal_penalty, self.static_penalty
-        penalty = penalty_at(self.temporal_penalty_, self.static_penalty_)
 
-        def fit_bags(design, penalty, initial, pair_bases=()):
+        def fit_bags(terms, initial):
+            design, penalty_at = assemble(terms)
+            penalty = penalty_at(self.temporal_penalty_, self.static_penalty_)
             rng = np.random.RandomState(self.random_state)
-            pair_end = design.shape[1]
-            static_end = pair_end - sum(u_z.shape[1] * w_z.shape[1] for u_z, w_z in pair_bases)
             self._bagged_intercepts = []
             self._bagged_temporal_coefficients = []
             self._bagged_static_coefficients = []
@@ -459,18 +483,17 @@ class SharedShapeTemporalGAMBoost:
                     design[fit_indices], target[fit_indices], sample_weight[fit_indices], penalty,
                     initial=initial,
                 )
-                self._bagged_intercepts.append(float(beta[0]))
-                self._bagged_temporal_coefficients.append(
-                    uncenter(beta[1:temporal_end].reshape(n_features, n_temporal), temporal_bases))
-                self._bagged_static_coefficients.append(
-                    None if static_design is None
-                    else uncenter(beta[temporal_end:static_end].reshape(n_static, -1), static_bases))
-                pair_coefficients, start = [], static_end
-                for u_z, w_z in pair_bases:
-                    size = u_z.shape[1] * w_z.shape[1]
-                    pair_coefficients.append(u_z @ beta[start:start + size].reshape(u_z.shape[1], -1) @ w_z.T)
+                coefficients: dict[str, list[np.ndarray]] = {"temporal": [], "static": [], "pair": []}
+                start = 1
+                for term in terms:
+                    size = term.design.shape[1]
+                    coefficients[term.kind].append(term.uncenter(beta[start:start + size]))
                     start += size
-                self._bagged_pair_coefficients.append(pair_coefficients)
+                self._bagged_intercepts.append(float(beta[0]))
+                self._bagged_temporal_coefficients.append(np.stack(coefficients["temporal"]))
+                self._bagged_static_coefficients.append(
+                    np.stack(coefficients["static"]) if coefficients["static"] else None)
+                self._bagged_pair_coefficients.append(coefficients["pair"])
                 self.n_iter_.append(n_iter)
 
             self._intercept = float(np.mean(self._bagged_intercepts))
@@ -480,7 +503,7 @@ class SharedShapeTemporalGAMBoost:
             self._pair_coefficients = [np.mean(bags, axis=0) for bags in zip(*self._bagged_pair_coefficients)]
 
         self._pairs, self._pair_bases = [], []
-        fit_bags(design, penalty, initial)
+        fit_bags(terms, initial)
         if n_interactions and pairs:
             pairs = list(pairs)
             if n_interactions < len(pairs):
@@ -490,13 +513,11 @@ class SharedShapeTemporalGAMBoost:
                                          pairs, n_interactions)
             pair_blocks = [self._pair_design(values, observed, static_values, pair) for pair in pairs]
             self._pairs, self._pair_bases = pairs, [bases for _, bases in pair_blocks]
-            pair_penalty = self._penalty_matrix(self.n_pair_bases, self.n_pair_bases, self.temporal_penalty_)
-            full_penalty = block_diag(penalty, *(np.kron(u_z, w_z).T @ pair_penalty @ np.kron(u_z, w_z)
-                                                 for u_z, w_z in self._pair_bases))
-            full_design = np.concatenate([design, *(block for block, _ in pair_blocks)], axis=1)
-            full_initial = None if initial is None else np.concatenate(
-                [initial, np.zeros(full_design.shape[1] - design.shape[1])])
-            fit_bags(full_design, full_penalty, full_initial, self._pair_bases)
+            pair_pieces = self._surface_pieces(self.n_pair_bases, self.n_pair_bases)
+            pair_terms = [_Term("pair", i, block, np.kron(u_z, w_z), pair_pieces, "temporal", factors=(u_z, w_z))
+                          for i, (block, (u_z, w_z)) in enumerate(pair_blocks)]
+            n_pair_columns = sum(t.design.shape[1] for t in pair_terms)
+            fit_bags(terms + pair_terms, None if initial is None else np.concatenate([initial, np.zeros(n_pair_columns)]))
         return self
 
     def contributions(self, values, observed, static_values):
