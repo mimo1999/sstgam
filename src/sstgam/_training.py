@@ -94,6 +94,27 @@ def quantile_edges(values: np.ndarray, n_bins: int) -> np.ndarray:
     return edges.astype(np.float64)
 
 
+def distinct_edges(values: np.ndarray, n_bins: int) -> np.ndarray:
+    """Bin edges ``[low, *thresholds, high]`` that never merge distinct values needlessly.
+
+    A value ``v`` falls in bin ``searchsorted(thresholds, v, "right")``. With at most ``n_bins`` distinct values each
+    gets its own bin (thresholds at the midpoints), so binary and few-level covariates are kept apart. Otherwise the
+    thresholds are the distinct interior quantiles above the minimum; one at the maximum (a mass point there) is
+    kept, so the maximum is not lumped into the bin below it. Always at least one bin.
+    """
+    if values.size == 0:
+        return np.array([0.0, 1.0])
+    distinct = np.unique(values)
+    if distinct.size == 1:
+        return np.array([distinct[0] - 0.5, distinct[0] + 0.5])
+    if distinct.size <= n_bins:
+        return np.concatenate([[distinct[0]], (distinct[:-1] + distinct[1:]) / 2.0, [distinct[-1]]]).astype(np.float64)
+    thresholds = np.unique(np.quantile(values, np.linspace(0.0, 1.0, n_bins + 1))[1:-1])
+    thresholds = thresholds[thresholds > distinct[0]]
+    high = np.nextafter(distinct[-1], np.inf) if thresholds.size and thresholds[-1] == distinct[-1] else distinct[-1]
+    return np.concatenate([[distinct[0]], thresholds, [high]]).astype(np.float64)
+
+
 def pair_cells(values, observed, static_values, pair):
     """Raw ``(u, w, mask)``, each ``(n, cells)``, for a pair of axes ``("temporal", k)`` / ``("static", j)``.
 

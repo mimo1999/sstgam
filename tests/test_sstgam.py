@@ -478,3 +478,28 @@ def test_missing_effects_with_reml_and_warning(longitudinal_data):
         SSTGAM(outer_bags=1).fit(X, y).missing_surface("signal", [0])
     with pytest.warns(UserWarning, match="missing_effects alone"):
         SSTGAM(missing_effects=True, include_missingness_indicators=True, outer_bags=1).fit(X, y)
+
+def test_tree_min_gain_and_distinct_edges(longitudinal_data):
+    from sstgam._training import distinct_edges, quantile_edges
+    X, y = longitudinal_data
+    fit = lambda **kw: SSTGAM(method="tree", max_rounds=12, early_stopping_rounds=4, random_state=1, **kw).fit(X, y)
+
+    # a gate nothing can pass leaves every table at zero: the model is the intercept alone
+    frozen = fit(min_gain=1e12)
+    assert all(not table.any() for table in frozen.model_._feature_tables + frozen.model_._static_tables)
+    assert np.ptp(frozen.predict_proba(X)[:, 1]) == 0
+    # a moderate gate still fits, and 0 (the default) is the ungated model
+    assert np.isfinite(fit(min_gain=2.0).predict_proba(X)[:, 1]).all()
+    np.testing.assert_array_equal(fit(min_gain=0.0).predict_proba(X), fit().predict_proba(X))
+
+    # few-level values keep their own bin; the default quantile edges merge them
+    levels = np.repeat([0.0, 1.0, 2.0], [80, 15, 5])
+    assert len(distinct_edges(levels, 16)) - 1 == 3 and len(quantile_edges(levels, 16)) - 1 < 3
+    mass_at_max = np.concatenate([np.linspace(0, 1, 60), np.full(40, 1.0)])
+    edges = distinct_edges(mass_at_max, 8)
+    assert np.searchsorted(edges[1:-1], 1.0, side="right") > np.searchsorted(edges[1:-1], 0.9, side="right")
+    assert np.isfinite(fit(bin_edges="distinct").predict_proba(X)[:, 1]).all()
+
+    for bad in ({"min_gain": -1.0}, {"bin_edges": "uniform"}):
+        with pytest.raises(ValueError):
+            fit(**bad)

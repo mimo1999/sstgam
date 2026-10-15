@@ -72,6 +72,8 @@ class _SSTGAMBase(BaseEstimator):
         bag_validation: str = "fixed",
         min_leaf_hessian: float | None = None,
         max_leaves: int | None = None,
+        min_gain: float = 0.0,
+        bin_edges: str = "quantile",
         random_state: int = 42,
     ) -> None:
         self.method = method
@@ -98,6 +100,8 @@ class _SSTGAMBase(BaseEstimator):
         self.bag_validation = bag_validation
         self.min_leaf_hessian = min_leaf_hessian
         self.max_leaves = max_leaves
+        self.min_gain = min_gain
+        self.bin_edges = bin_edges
         self.random_state = random_state
 
     def _parse_columns(self, column_names: list[str]):
@@ -338,6 +342,10 @@ class _SSTGAMBase(BaseEstimator):
             raise ValueError(f"bag_validation must be 'fixed' or 'per_bag', got {self.bag_validation!r}")
         if self.min_leaf_hessian is not None and self.min_leaf_hessian < 0:
             raise ValueError("min_leaf_hessian must be non-negative.")
+        if self.min_gain < 0:
+            raise ValueError("min_gain must be non-negative.")
+        if self.bin_edges not in {"quantile", "distinct"}:
+            raise ValueError(f"bin_edges must be 'quantile' or 'distinct', got {self.bin_edges!r}")
         if self.max_leaves is not None and self.max_leaves < 2:
             raise ValueError("max_leaves must be at least 2.")
         if self.learning_rate <= 0:
@@ -364,6 +372,8 @@ class _SSTGAMBase(BaseEstimator):
                 bag_validation=self.bag_validation,
                 min_leaf_hessian=self.min_leaf_hessian,
                 max_leaves=self.max_leaves,
+                min_gain=self.min_gain,
+                bin_edges=self.bin_edges,
                 missing_effects=self.missing_effects,
             )
         return SharedShapeTemporalGAMBoost(
@@ -611,6 +621,16 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
     min_leaf_hessian, max_leaves : optional
         Tree method: the smallest total curvature a leaf may hold, and the
         largest number of leaves per tree update.
+    min_gain : float, default=0.0
+        Tree method: skip a table update (leave that term alone this round)
+        unless its Newton gain, twice the second-order loss decrease, reaches
+        this value; ``0`` never skips. About 8 (a chi-square(1) 99.5% point)
+        stops tables from being fitted to noise every round. Applies to
+        temporal, static, "not measured" and pair updates.
+    bin_edges : {"quantile", "distinct"}, default="quantile"
+        Tree method: ``"distinct"`` gives each value its own bin when a
+        covariate has at most ``n_value_bins`` (static: 16) distinct values
+        and keeps a mass point at the maximum in its own bin.
     random_state
         Random seed (validation split, bootstrap bags, tree fitting).
 
@@ -691,6 +711,8 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
         bag_validation: str = "fixed",
         min_leaf_hessian: float | None = None,
         max_leaves: int | None = None,
+        min_gain: float = 0.0,
+        bin_edges: str = "quantile",
         random_state: int = 42,
     ) -> None:
         super().__init__(
@@ -703,7 +725,7 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
             static_columns=static_columns, interactions=interactions, n_pair_bases=n_pair_bases,
             penalty_sharing=penalty_sharing, missing_effects=missing_effects, bag_validation=bag_validation,
             min_leaf_hessian=min_leaf_hessian,
-            max_leaves=max_leaves, random_state=random_state,
+            max_leaves=max_leaves, min_gain=min_gain, bin_edges=bin_edges, random_state=random_state,
         )
         self.family = family
 

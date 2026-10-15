@@ -8,6 +8,7 @@ from ._training import (
     Family,
     bootstrap_bags,
     center_pair,
+    distinct_edges,
     fast_gain,
     make_validation_split,
     pair_cells,
@@ -82,6 +83,11 @@ class SharedShapeTemporalGAMTreeBoost:
     penalty (see ``_AXIS_PENALTY_LAMBDA``). Static (1-D) terms use a plain
     single-stage tree.
 
+    With ``min_gain > 0`` a table update is skipped (that term is left alone
+    this round) unless its Newton gain reaches ``min_gain``; see ``_gated``.
+    ``bin_edges="distinct"`` keeps few-level and mass-point values in their
+    own bins; see ``_training.distinct_edges``.
+
     ``outer_bags`` bagged fits (fixed validation split, bootstrapped training
     rows) are averaged at the end, as in EBM.
     """
@@ -101,8 +107,12 @@ class SharedShapeTemporalGAMTreeBoost:
         min_leaf_hessian: float | None = None,
         max_leaves: int | None = None,
         missing_effects: bool | str = False,
+        min_gain: float = 0.0,
+        bin_edges: str = "quantile",
     ) -> None:
         self.family = family
+        self.min_gain = min_gain
+        self.bin_edges = bin_edges
         self.missing_effects = missing_effects
         self.bag_validation = bag_validation
         self.min_leaf_hessian = min_leaf_hessian
@@ -120,11 +130,14 @@ class SharedShapeTemporalGAMTreeBoost:
     def _bin(values: np.ndarray, edges: np.ndarray) -> np.ndarray:
         return np.searchsorted(edges[1:-1], values, side="right").astype(np.int32)
 
+    def _edges(self, values, n_bins: int) -> np.ndarray:
+        return (distinct_edges if self.bin_edges == "distinct" else quantile_edges)(values, n_bins)
+
     def _fit_bins(self, values, observed, static_values) -> None:
         self._value_edges = []
         for feature_index in range(values.shape[1]):
             feature_values = values[:, feature_index, :][observed[:, feature_index, :] > 0.5]
-            self._value_edges.append(quantile_edges(feature_values, self.n_value_bins))
+            self._value_edges.append(self._edges(feature_values, self.n_value_bins))
 
         self._static_edges = []
         self._static_fill = np.zeros(static_values.shape[1], dtype=np.float64)
@@ -132,7 +145,7 @@ class SharedShapeTemporalGAMTreeBoost:
             column = static_values[:, column_index]
             finite_values = column[np.isfinite(column)]
             self._static_fill[column_index] = np.median(finite_values) if finite_values.size else 0.0
-            self._static_edges.append(quantile_edges(finite_values, _N_STATIC_BINS))
+            self._static_edges.append(self._edges(finite_values, _N_STATIC_BINS))
 
     def _feature_bins(self, values) -> list[np.ndarray]:
         return [self._bin(np.nan_to_num(values[:, feature_index, :], nan=0.0), edges)
@@ -163,6 +176,18 @@ class SharedShapeTemporalGAMTreeBoost:
             limits["max_leaf_nodes"] = self.max_leaves
         return limits
 
+    def _gated(self, update, gradient_sum, hessian_sum):
+        """``update``, or ``None`` (skip this term this round) if its Newton gain is below ``min_gain``.
+
+        The gain ``sum_c (2 g_c u_c - h_c u_c^2)`` over cells is twice the second-order loss decrease of the
+        step; for tree leaf values ``u = G/H`` it equals ``sum_leaf G^2/H``, a Wald chi-square of the step
+        against zero (unit dispersion). Gaussian gains are divided by the outcome variance.
+        """
+        if update is None or self.min_gain <= 0:
+            return update
+        gain = float(np.sum(2.0 * gradient_sum * update - hessian_sum * update ** 2))
+        return update if gain / self._dispersion >= self.min_gain else None
+
     def _tree_update(self, coordinates, gradient_sum, hessian_sum, rng):
         """Plain single-stage tree update -- used for 1-D (static) terms."""
         active = hessian_sum > _MIN_HESSIAN
@@ -175,7 +200,7 @@ class SharedShapeTemporalGAMTreeBoost:
             **self._leaf_limits(hessian_sum[active].sum()),
         )
         tree.fit(coordinates[active], targets, sample_weight=hessian_sum[active])
-        return tree.predict(coordinates)
+        return self._gated(tree.predict(coordinates), gradient_sum, hessian_sum)
 
     @staticmethod
     def _weighted_gain(target, weight, prediction) -> float:
@@ -241,7 +266,7 @@ class SharedShapeTemporalGAMTreeBoost:
                                                 **limits)
             second_tree.fit(second_column[group_active], targets[group_active], sample_weight=hessian_sum[group_active])
             update[mask] = second_tree.predict(second_column[mask])
-        return update
+        return self._gated(update, gradient_sum, hessian_sum)
 
     def _update_temporal_term(self, gradient, hessian, cell_ids, observed,
                               coordinates, n_cells, rng):
@@ -300,6 +325,8 @@ class SharedShapeTemporalGAMTreeBoost:
                    else np.asarray(sample_weight, dtype=np.float64).ravel())
 
         self._n_times = n_times
+        # binomial and poisson have unit dispersion; a gaussian gain is in outcome units squared
+        self._dispersion = (max(float(np.cov(target, aweights=weights)), 1e-12) if self.family == "gaussian" else 1.0)
         self._fit_bins(values, observed, static_values)
         feature_bins = self._feature_bins(values)
         static_bins = self._static_bins(static_values)
