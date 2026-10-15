@@ -214,8 +214,9 @@ data.
 
 Spline models expose `value_effect` and `temporal_surface`. Tree models expose
 `value_time_table`. Both expose `static_effect` for static covariates and
-missingness indicators, all with an optional bootstrap band across the bagged
-fits. Each output is on the log-odds scale. Because the model is additive,
+missingness indicators. The spline surfaces take a pointwise Bayesian band from
+`(H + S)^-1` at the final fit; the other terms take a bootstrap band across the
+bagged fits. Each output is on the log-odds scale. Because the model is additive,
 `explain(X)` splits every prediction exactly into the intercept, one term per
 observed `(feature, time)` cell and one per static column (backends'
 `contributions`); `decision_function` is their sum and `term_importances_`

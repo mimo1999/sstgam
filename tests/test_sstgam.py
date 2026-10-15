@@ -65,23 +65,27 @@ def test_bspline_basis_fits_and_predicts(longitudinal_data):
         SSTGAM(basis="unknown").fit(X, y)
 
 
-def test_bootstrap_interval_shrinks_with_more_bags(longitudinal_data):
+def test_spline_bands_are_bayesian_and_shrink_with_more_data(longitudinal_data):
     X, y = longitudinal_data
 
-    def interval_width(outer_bags):
-        model = SSTGAM(
-            method="spline", max_rounds=12, early_stopping_rounds=4,
-            outer_bags=outer_bags, random_state=4,
-        ).fit(X, y)
+    def band_width(n):
+        model = SSTGAM(method="spline", max_rounds=12, early_stopping_rounds=4, outer_bags=1, random_state=4
+                       ).fit(X.iloc[:n], y[:n])
         lower, mean, upper = model.value_effect("signal", [0.0, 1.0], return_interval=True)
         assert np.all(lower <= mean + 1e-9) and np.all(mean <= upper + 1e-9)
         return float(np.mean(upper - lower))
 
-    width_single_bag = interval_width(outer_bags=1)
-    width_many_bags = interval_width(outer_bags=12)
+    width_small, width_large = band_width(len(y) // 3), band_width(len(y))
+    assert 0.0 < width_large < width_small  # a single bag still gets a non-degenerate band
 
-    assert width_single_bag == pytest.approx(0.0, abs=1e-9)
-    assert width_many_bags >= 0.0
+
+def test_centred_surface_has_zero_training_mean_at_each_time(longitudinal_data):
+    X, y = longitudinal_data
+    model = SSTGAM(method="spline", outer_bags=1, random_state=4).fit(X, y)
+    for time_index, time_id in enumerate(model.time_ids_):
+        column = X[f"signal_{time_id}"].dropna().to_numpy()
+        surface = model.temporal_surface("signal", column, [time_id], center_time=True)
+        assert abs(float(surface.mean())) < 1e-4, (time_id, surface.mean())
 
 
 def test_temporal_surface_and_value_time_table_intervals(longitudinal_data):

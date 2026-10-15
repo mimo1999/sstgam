@@ -406,8 +406,7 @@ class _SSTGAMBase(BaseEstimator):
 
         ``values`` may be a scalar or 1-D array; the result has one entry per
         value. With ``return_interval=True``, returns a ``(lower, mean, upper)``
-        bootstrap percentile band computed across the ``outer_bags`` bagged
-        fits (see ``ARCHITECTURE.md``) instead of a single point estimate.
+        pointwise 95% Bayesian band (see ``temporal_surface``).
         """
         if self.method != "spline":
             raise ValueError("value_effect is only available when method='spline'.")
@@ -418,12 +417,16 @@ class _SSTGAMBase(BaseEstimator):
         )
 
     def temporal_surface(self, feature: str, values, time_coordinates,
-                         return_interval: bool = False) -> _Effect:
+                         return_interval: bool = False, center_time: bool = False) -> _Effect:
         """Evaluate a spline feature's value-time surface on the link scale.
 
-        With ``return_interval=True``, returns a ``(lower, mean, upper)``
-        bootstrap percentile band computed across the ``outer_bags`` bagged
-        fits instead of a single point estimate.
+        The per-time level of the surface is not identified by the data (adding a function of time alone
+        that sums to zero over time leaves every prediction unchanged), so ``center_time=True`` removes the
+        mean over the training cells at each time: use it to read or plot a surface.
+        With ``return_interval=True``, returns ``(lower, mean, upper)``, a pointwise 95% Bayesian band from
+        the penalised posterior covariance. It is conditional on the smoothing parameters and ignores
+        penalisation bias, so expect under-coverage at extreme values and where the surface is steep;
+        it is not a simultaneous band.
         """
         if self.method != "spline":
             raise ValueError("temporal_surface is only available when method='spline'.")
@@ -431,7 +434,8 @@ class _SSTGAMBase(BaseEstimator):
         normalized_values = self.model_.normalize_values(feature_index, values)
         normalized_time = self.model_.normalize_time(time_coordinates)
         return self.model_.temporal_surface_normalized(
-            feature_index, normalized_values, normalized_time, return_interval=return_interval
+            feature_index, normalized_values, normalized_time, return_interval=return_interval,
+            center_time=center_time,
         )
 
     def static_effect(self, feature: str, values, return_interval: bool = False) -> _Effect:
@@ -579,8 +583,9 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
         across bags) whose coefficients/tables are averaged at the end --
         the same bagging EBM uses for variance reduction. ``outer_bags=1``
         disables bagging (a single fit on the full training split). The
-        ``return_interval`` bands are percentiles across these fits, so use
-        20 or more when the bands matter.
+        ``return_interval`` bands of the tree method and of ``static_effect``,
+        ``interaction_surface`` and ``missing_surface`` are percentiles across
+        these fits (a stability check); the spline surfaces use a Bayesian band.
     include_missingness_indicators : bool, default=False
         When ``True``, adds one extra static covariate per temporal feature:
         the fraction of its time points that were observed for that sample.

@@ -196,12 +196,18 @@ spline effects average zero over the training data, so positive means
 | `term_importances_` | both | dict of each term's mean absolute contribution over the training rows, largest first |
 
 `temporal_surface`, `value_effect`, `static_effect`, `interaction_surface` and `value_time_table` take
-`return_interval=True` and then return `(lower, mean, upper)`: the 2.5 and
-97.5 percentiles across the `outer_bags` bootstrap fits. With the default 4
-bags this is a rough stability check, not a calibrated interval; raise
-`outer_bags` (e.g. 20) when the bands matter. Time coordinates are the ids
-from the column names; outside the range seen in training the surface is
-extrapolated and unreliable.
+`return_interval=True` and then return `(lower, mean, upper)`. For the spline
+surfaces (`temporal_surface`, `value_effect`) this is a pointwise 95% Bayesian
+band from the penalised posterior covariance: in simulation it covers about
+90% on average, less at extreme values and where the surface is steep, it is
+conditional on the smoothing parameters, and it is not a simultaneous band.
+For the other terms (`static_effect`, `interaction_surface`, `value_time_table`)
+it is the 2.5/97.5 percentile range across the `outer_bags` bootstrap fits,
+which is a stability check, not a calibrated interval. The per-time level of a
+surface is not identified by the data: pass `center_time=True` to
+`temporal_surface` to read it with the training mean removed at each time.
+Time coordinates are the ids from the column names; outside the range seen in
+training the surface is extrapolated and unreliable.
 
 A patient's score is the sum of what each observed cell adds, so a prediction
 can be explained day by day. `explain(X)` returns exactly these per-day

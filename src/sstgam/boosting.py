@@ -541,6 +541,7 @@ class SharedShapeTemporalGAMBoost:
             self.basis, -value_span, value_span, self.n_pair_bases
         )
         time_coordinates = np.asarray(time_coordinates, dtype=np.float32)
+        self._fitted_times = time_coordinates
         self._time_min = float(time_coordinates.min())
         self._time_range = max(float(time_coordinates.max()) - self._time_min, 1.0)
         self._time_basis_a, self._time_basis_b = make_basis_params(self.basis, 0.0, 1.0, self.n_time_bases)
@@ -553,6 +554,16 @@ class SharedShapeTemporalGAMBoost:
         if reml and "auto" in (self.temporal_penalty, self.static_penalty):
             raise ValueError("temporal_penalty and static_penalty cannot mix 'auto' and 'reml'.")
         temporal_design, static_design = self._build_designs(values, observed, static_values)
+        # Mean value basis over the observed cells of each time point: the per-time level of a surface is not
+        # identified, so surfaces can be reported with this mean removed (the training cells average to zero).
+        self._slice_means = np.zeros((n_features, values.shape[2], self.n_value_bases))
+        for k in range(n_features):
+            for t in range(values.shape[2]):
+                seen = observed[:, k, t] > 0
+                if seen.any():
+                    self._slice_means[k, t] = basis_design(
+                        self.basis, self.normalize_values(k, values[seen, k, t]),
+                        self._value_basis_a, self._value_basis_b).mean(axis=0)
         # Every term is fitted in centred coordinates theta (coefficients = basis @ theta), then mapped back.
         observed_cells = np.maximum(observed.sum(axis=(0, 2)), 1.0)
         surface_pieces = self._surface_pieces(self.n_value_bases, self.n_time_bases)
@@ -657,6 +668,18 @@ class SharedShapeTemporalGAMBoost:
                     if coefficients["missing"] else None)
                 self.n_iter_.append(n_iter)
 
+            # Posterior covariance (H + S)^-1 at the last fit (exact for one bag), mapped to uncentred coefficients.
+            eta = np.concatenate([design[rows].astype(np.float64) @ beta for rows in _row_chunks(design.shape[0])])
+            hessian = self._hessian(design, sample_weight, eta)
+            covariance = np.linalg.inv(hessian + penalty)
+            if self.family == "gaussian":
+                edf = (covariance * hessian.T).sum()
+                covariance = covariance * (np.sum(sample_weight * (target - FAMILIES[self.family].mean(eta)) ** 2)
+                                           / max(sample_weight.sum() - edf, 1.0))
+            offsets = np.cumsum([1] + [t.design.shape[1] for t in terms])
+            self._surface_covariance = [t.basis @ covariance[lo:hi, lo:hi] @ t.basis.T
+                                        for t, lo, hi in zip(terms, offsets[:-1], offsets[1:])
+                                        if t.kind == "temporal"]
             self._intercept = float(np.mean(self._bagged_intercepts))
             self._temporal_coefficients = np.mean(self._bagged_temporal_coefficients, axis=0)
             self._static_coefficients = (None if static_design is None
@@ -754,20 +777,48 @@ class SharedShapeTemporalGAMBoost:
             for bag_coefficients in self._bagged_temporal_coefficients
         ], axis=0)
 
-    def temporal_surface_normalized(self, feature_index: int, value_grid,
-                                    normalized_time_grid, return_interval: bool = False):
+    def _slice_mean(self, feature_index: int, normalized_time_grid) -> np.ndarray:
+        """Mean value basis over the training cells at each time of the grid: ``(len(grid), n_value_bases)``."""
+        times = self.normalize_time(self._fitted_times)
+        order = np.argsort(times)
+        means = self._slice_means[feature_index][order]
+        grid = np.asarray(normalized_time_grid, dtype=np.float64)
+        return np.stack([np.interp(grid, times[order], means[:, j]) for j in range(means.shape[1])], axis=1)
+
+    def _surface_functional(self, feature_index: int, value_grid, normalized_time_grid, center_time: bool):
+        """Rows ``a`` with surface(v, t) = a . coefficients on a grid: ``(n_values, n_times, p_v * p_t)``."""
+        value_basis = basis_design(self.basis, np.asarray(value_grid, dtype=np.float32),
+                                   self._value_basis_a, self._value_basis_b)
+        time_basis = basis_design(self.basis, np.asarray(normalized_time_grid, dtype=np.float32),
+                                  self._time_basis_a, self._time_basis_b)
+        value_part = np.broadcast_to(value_basis[:, None, :], (len(value_basis), len(time_basis), value_basis.shape[1]))
+        if center_time:
+            value_part = value_part - self._slice_mean(feature_index, normalized_time_grid)[None]
+        rows = value_part[:, :, :, None] * time_basis[None, :, None, :]
+        return rows.reshape(len(value_basis), len(time_basis), -1)
+
+    def _band(self, feature_index: int, rows: np.ndarray, mean: np.ndarray):
+        """Pointwise 95% Bayesian band ``(lower, mean, upper)`` for linear functionals ``rows`` of the surface."""
+        variance = np.einsum("...j,jk,...k->...", rows, self._surface_covariance[feature_index], rows)
+        half = 1.96 * np.sqrt(np.maximum(variance, 0.0))
+        return mean - half, mean, mean + half
+
+    def temporal_surface_normalized(self, feature_index: int, value_grid, normalized_time_grid,
+                                    return_interval: bool = False, center_time: bool = False):
         """Evaluate one fitted value-time surface on normalized coordinates.
 
-        With ``return_interval=True``, returns a ``(lower, mean, upper)``
-        bootstrap percentile band (2.5/97.5) computed across the
-        ``outer_bags`` bagged fits instead of a single point estimate. With
-        ``outer_bags=1`` the band collapses to the point estimate.
+        ``center_time=True`` removes the per-time mean over the training cells (the per-time level of a
+        surface is not identified). With ``return_interval=True``, returns ``(lower, mean, upper)``: a
+        pointwise 95% Bayesian band from the penalised posterior covariance ``(H + S)^-1``, conditional on
+        the smoothing parameters and ignoring penalisation bias.
         """
-        surfaces = self._bagged_surfaces(feature_index, value_grid, normalized_time_grid)
-        return percentile_band(surfaces) if return_interval else surfaces.mean(axis=0)
+        rows = self._surface_functional(feature_index, value_grid, normalized_time_grid, center_time)
+        mean = rows @ self._temporal_coefficients[feature_index]
+        return self._band(feature_index, rows, mean) if return_interval else mean
 
-    def mean_value_effect_normalized(self, feature_index: int, value_grid,
-                                     return_interval: bool = False):
+    def mean_value_effect_normalized(self, feature_index: int, value_grid, return_interval: bool = False):
+        """Value effect averaged over time (a linear functional, so it gets the same Bayesian band)."""
         time_grid = np.linspace(0.0, 1.0, self.n_time_bases * 3)
-        per_bag_effect = self._bagged_surfaces(feature_index, value_grid, time_grid).mean(axis=2)
-        return percentile_band(per_bag_effect) if return_interval else per_bag_effect.mean(axis=0)
+        rows = self._surface_functional(feature_index, value_grid, time_grid, False).mean(axis=1)
+        mean = rows @ self._temporal_coefficients[feature_index]
+        return self._band(feature_index, rows, mean) if return_interval else mean
