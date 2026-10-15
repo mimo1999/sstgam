@@ -127,7 +127,7 @@ class SharedShapeTemporalGAMBoost:
         n_pair_bases: int = 6,
         n_pair_bins: int = 16,
         penalty_sharing: str = "per_term",
-        missing_effects: bool = False,
+        missing_effects: bool | str = False,
     ) -> None:
         self.family = family
         self.penalty_sharing = penalty_sharing
@@ -555,12 +555,14 @@ class SharedShapeTemporalGAMBoost:
             # Measurement process: a smooth, time-varying effect u_k(tau) of feature k NOT being measured.
             time_difference = second_diff_matrix_np(self.n_time_bases)
             missing_pieces = [("time", time_difference.T @ time_difference), ("shrink", np.eye(self.n_time_bases))]
-            for k in range(n_features):
-                # Not centred: a sum-to-zero constraint would remove the "each unmeasured cell shifts the
-                # log-odds by a constant" direction, i.e. the effect of the missing-cell count itself.
-                block = (1.0 - observed[:, k, :]).astype(np.float32) @ self._time_basis.astype(np.float32)
-                basis = np.eye(self.n_time_bases)
-                terms.append(_Term("missing", k, block, basis, missing_pieces, "temporal"))
+            # Not centred: a sum-to-zero constraint would remove the "each unmeasured cell shifts the
+            # log-odds by a constant" direction, i.e. the effect of the missing-cell count itself.
+            blocks = [(1.0 - observed[:, k, :]).astype(np.float32) @ self._time_basis.astype(np.float32)
+                      for k in range(n_features)]
+            if self.missing_effects == "pooled":  # one u(tau) shared by every feature
+                blocks = [np.sum(blocks, axis=0)]
+            for k, block in enumerate(blocks):
+                terms.append(_Term("missing", k, block, np.eye(self.n_time_bases), missing_pieces, "temporal"))
         if static_design is not None:
             static_pieces = self._static_pieces(self.n_static_bases, shrink=reml)
             for j in range(n_static):
@@ -641,7 +643,8 @@ class SharedShapeTemporalGAMBoost:
                     np.stack(coefficients["static"]) if coefficients["static"] else None)
                 self._bagged_pair_coefficients.append(coefficients["pair"])
                 self._bagged_missing_coefficients.append(
-                    np.stack(coefficients["missing"]) if coefficients["missing"] else None)
+                    np.resize(np.stack(coefficients["missing"]), (n_features, self.n_time_bases))
+                    if coefficients["missing"] else None)
                 self.n_iter_.append(n_iter)
 
             self._intercept = float(np.mean(self._bagged_intercepts))

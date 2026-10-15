@@ -68,7 +68,7 @@ class _SSTGAMBase(BaseEstimator):
         interactions: int | Iterable[tuple[str, str]] = 0,
         n_pair_bases: int = 6,
         penalty_sharing: str = "per_term",
-        missing_effects: bool = False,
+        missing_effects: bool | str = False,
         bag_validation: str = "fixed",
         min_leaf_hessian: float | None = None,
         max_leaves: int | None = None,
@@ -272,7 +272,8 @@ class _SSTGAMBase(BaseEstimator):
         if kind == "pair":
             return " x ".join(self._axis_name(axis) for axis in self.model_._pairs[index])
         if kind == "missing":
-            return f"{self.temporal_features_[index]} [not measured]"
+            return ("[not measured]" if self.missing_effects == "pooled"
+                    else f"{self.temporal_features_[index]} [not measured]")
         return (self.temporal_features_ if kind == "temporal" else self.static_features_)[index]
 
     def _axis_name(self, axis) -> str:
@@ -329,6 +330,8 @@ class _SSTGAMBase(BaseEstimator):
                 raise ValueError(f"{name} must be 'auto', 'reml' or a positive number, got {value!r}")
         if {self.temporal_penalty, self.static_penalty} == {"auto", "reml"}:
             raise ValueError("temporal_penalty and static_penalty cannot mix 'auto' and 'reml'.")
+        if self.missing_effects not in (False, True, "pooled"):
+            raise ValueError(f"missing_effects must be True, False or 'pooled', got {self.missing_effects!r}")
         if self.penalty_sharing not in {"per_term", "shared"}:
             raise ValueError(f"penalty_sharing must be 'per_term' or 'shared', got {self.penalty_sharing!r}")
         if self.bag_validation not in {"fixed", "per_bag"}:
@@ -590,14 +593,18 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
     n_pair_bases : int, default=6
         Bases per axis of each spline interaction surface. Tree interactions
         reuse their two terms' bins, and pair ranking uses ``n_value_bins``.
-    missing_effects : bool, default=False
+    missing_effects : bool or "pooled", default=False
         Adds one term per temporal feature for the measurement process: a
         smooth (spline) or binned (tree) effect over time of the feature *not*
         being measured. Without it a missing cell adds nothing, which assumes
         missingness carries no information; with it the model learns, for
         example, that not checking a lab on a given day signals lower risk.
         Inspect it with ``missing_surface``; ``explain(X).missing`` holds the
-        per-cell contributions.
+        per-cell contributions. ``"pooled"`` fits one effect over time shared
+        by every feature (an unmeasured cell of any feature counts the same):
+        far fewer coefficients, so it costs less when missingness carries no
+        information, and suits data where sicker patients are measured more
+        overall rather than one lab at a time.
     bag_validation : {"fixed", "per_bag"}, default="fixed"
         Tree method: one validation split shared by every bag, or a fresh
         split per bag (as EBM does), so the early-stopping points differ.
@@ -680,7 +687,7 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
         interactions: int | Iterable[tuple[str, str]] = 0,
         n_pair_bases: int = 6,
         penalty_sharing: str = "per_term",
-        missing_effects: bool = False,
+        missing_effects: bool | str = False,
         bag_validation: str = "fixed",
         min_leaf_hessian: float | None = None,
         max_leaves: int | None = None,

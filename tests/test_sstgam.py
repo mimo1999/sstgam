@@ -449,18 +449,24 @@ def test_missing_effects_learn_from_the_measurement_process(method):
     assert "signal [not measured]" in model.term_importances_
 
 
+@pytest.mark.parametrize("pooled", [False, True])
 @pytest.mark.parametrize("method", ["spline", "tree"])
-def test_missing_effects_capture_the_missing_count(method):
+def test_missing_effects_capture_the_missing_count(method, pooled):
     # risk rises with how often a patient goes unmeasured, at every time alike
     rng = np.random.RandomState(0)
     rate = rng.uniform(0.3, 0.95, size=2000)
     observed = rng.rand(2000, 6) < rate[:, None]
     values = np.where(observed, rng.normal(size=(2000, 6)), np.nan)
-    X = pd.DataFrame(values, columns=[f"signal_{t}" for t in range(6)])
-    missing_count = (~observed).sum(axis=1)
-    y = (rng.rand(2000) < 1 / (1 + np.exp(-(missing_count - 2.0)))).astype(int)
-    model = SSTGAM(method=method, missing_effects=True, outer_bags=1, random_state=0).fit(X, y)
+    other = np.where(rng.rand(2000, 6) < rate[:, None], rng.normal(size=(2000, 6)), np.nan)
+    X = pd.DataFrame(np.hstack([values, other]),
+                     columns=[f"signal_{t}" for t in range(6)] + [f"other_{t}" for t in range(6)])
+    missing_count = (~observed).sum(axis=1) + np.isnan(other).sum(axis=1)
+    y = (rng.rand(2000) < 1 / (1 + np.exp(-(missing_count / 2 - 2.0)))).astype(int)
+    model = SSTGAM(method=method, missing_effects="pooled" if pooled else True, outer_bags=1,
+                   random_state=0).fit(X, y)
     effect = model.explain(X).missing.sum(axis=(1, 2))
+    if pooled:  # one effect over time shared by every feature
+        np.testing.assert_allclose(model.missing_surface("signal", [0, 5]), model.missing_surface("other", [0, 5]))
     assert np.corrcoef(effect, missing_count)[0, 1] > 0.8
 
 

@@ -100,7 +100,7 @@ class SharedShapeTemporalGAMTreeBoost:
         bag_validation: str = "fixed",
         min_leaf_hessian: float | None = None,
         max_leaves: int | None = None,
-        missing_effects: bool = False,
+        missing_effects: bool | str = False,
     ) -> None:
         self.family = family
         self.missing_effects = missing_effects
@@ -414,16 +414,20 @@ class SharedShapeTemporalGAMTreeBoost:
                 validation_score += (update[validation_cells[feature_index]] *
                                      validation_observed[:, feature_index, :]).sum(axis=1)
 
-            for feature_index, table in enumerate(missing_tables):
+            # each group of features shares one "not measured" table: every feature alone, or all ("pooled")
+            groups = ([list(range(len(missing_tables)))] if self.missing_effects == "pooled" and missing_tables
+                      else [[k] for k in range(len(missing_tables))])
+            for group in groups:
                 gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
-                fit_missing = 1.0 - fit_observed[:, feature_index, :]
+                fit_missing = (1.0 - fit_observed[:, group, :]).sum(axis=1)
                 update = self._tree_update(missing_coordinates, gradient @ fit_missing, hessian @ fit_missing, rng)
                 if update is None:
                     continue
                 update *= self.learning_rate
-                table += update
+                for feature_index in group:
+                    missing_tables[feature_index] += update
                 fit_score += fit_missing @ update
-                validation_score += (1.0 - validation_observed[:, feature_index, :]) @ update
+                validation_score += (1.0 - validation_observed[:, group, :]).sum(axis=1) @ update
 
             for column_index, table in enumerate(static_tables):
                 gradient, hessian = self._grad_hess(fit_score, fit_target, fit_weight)
