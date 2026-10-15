@@ -42,7 +42,7 @@ _AUTO_PENALTY_MIN_HELDOUT_EVENTS = 500
 _AUTO_PENALTY_CV_FOLDS = 5
 # penalty="reml": generalised Fellner-Schall iterations, convergence on the log smoothing parameters, bounds.
 _REML_MAX_ITERATIONS = 60
-_REML_TOLERANCE = 1e-3
+_REML_TOLERANCE = 2e-6  # relative change of the REML score, twice in a row
 _REML_BOUNDS = (1e-6, 1e8)
 
 
@@ -413,6 +413,7 @@ class SharedShapeTemporalGAMBoost:
 
         beta = initial
         self.reml_iterations_ = 0
+        previous_score, previous_small = None, False
         for iteration in range(1, _REML_MAX_ITERATIONS + 1):
             per_term = term_strengths()
             penalty = block_diag(np.full((1, 1), _RIDGE), *(t.penalty_with(s) for t, s in zip(terms, per_term)))
@@ -427,12 +428,14 @@ class SharedShapeTemporalGAMBoost:
             else:
                 scale = 1.0
             numerator, denominator = np.zeros(len(parameter)), np.zeros(len(parameter))
+            log_det_penalty = 0.0
             for t, is_tuned, pieces, s, lo, hi in zip(terms, tuned, centred, per_term, offsets[:-1], offsets[1:]):
                 if not is_tuned:
                     continue
                 block_penalty = sum(strength * piece for strength, piece in zip(s, pieces))
                 values, vectors = np.linalg.eigh(block_penalty)
                 keep = values > values.max() * 1e-10
+                log_det_penalty += np.sum(np.log(values[keep]))
                 pseudo_inverse = (vectors[:, keep] / values[keep]) @ vectors[:, keep].T
                 block_inverse, theta = inverse[lo:hi, lo:hi], beta[lo:hi]
                 for (label, _), piece in zip(t.pieces, pieces):
@@ -443,7 +446,14 @@ class SharedShapeTemporalGAMBoost:
             # Damped update: at most a factor of 10 per step; a non-positive numerator means "smooth less".
             step = np.where(numerator > 0, np.log(np.maximum(ratio, 1e-300)), -np.log(10.0))
             updated = np.clip(strengths * np.exp(np.clip(step, -np.log(10.0), np.log(10.0))), low, high)
-            converged = np.max(np.abs(np.log(updated) - np.log(strengths)), initial=0.0) < _REML_TOLERANCE
+            # Stop on the (Laplace) REML score, not on the parameters: a piece smoothed away entirely has no
+            # finite optimum, and its parameter keeps cycling near the upper bound while the score is flat.
+            score = (np.sum(sample_weight * family.loss(eta, target)) + 0.5 * beta @ penalty @ beta
+                     - 0.5 * log_det_penalty + 0.5 * np.linalg.slogdet(hessian + penalty)[1])
+            small = (previous_score is not None
+                     and abs(score - previous_score) / (abs(score) + 1.0) < _REML_TOLERANCE)
+            converged = small and previous_small
+            previous_score, previous_small = score, small
             strengths = updated
             self.reml_iterations_ = iteration
             if converged:
