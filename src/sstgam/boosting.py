@@ -556,9 +556,11 @@ class SharedShapeTemporalGAMBoost:
             time_difference = second_diff_matrix_np(self.n_time_bases)
             missing_pieces = [("time", time_difference.T @ time_difference), ("shrink", np.eye(self.n_time_bases))]
             for k in range(n_features):
-                block = (1.0 - observed[:, k, :]).astype(np.float64) @ self._time_basis
-                basis = self._centering_basis(block.mean(axis=0))
-                terms.append(_Term("missing", k, (block @ basis).astype(np.float32), basis, missing_pieces, "temporal"))
+                # Not centred: a sum-to-zero constraint would remove the "each unmeasured cell shifts the
+                # log-odds by a constant" direction, i.e. the effect of the missing-cell count itself.
+                block = (1.0 - observed[:, k, :]).astype(np.float32) @ self._time_basis.astype(np.float32)
+                basis = np.eye(self.n_time_bases)
+                terms.append(_Term("missing", k, block, basis, missing_pieces, "temporal"))
         if static_design is not None:
             static_pieces = self._static_pieces(self.n_static_bases, shrink=reml)
             for j in range(n_static):

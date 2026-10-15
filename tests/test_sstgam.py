@@ -449,6 +449,21 @@ def test_missing_effects_learn_from_the_measurement_process(method):
     assert "signal [not measured]" in model.term_importances_
 
 
+@pytest.mark.parametrize("method", ["spline", "tree"])
+def test_missing_effects_capture_the_missing_count(method):
+    # risk rises with how often a patient goes unmeasured, at every time alike
+    rng = np.random.RandomState(0)
+    rate = rng.uniform(0.3, 0.95, size=2000)
+    observed = rng.rand(2000, 6) < rate[:, None]
+    values = np.where(observed, rng.normal(size=(2000, 6)), np.nan)
+    X = pd.DataFrame(values, columns=[f"signal_{t}" for t in range(6)])
+    missing_count = (~observed).sum(axis=1)
+    y = (rng.rand(2000) < 1 / (1 + np.exp(-(missing_count - 2.0)))).astype(int)
+    model = SSTGAM(method=method, missing_effects=True, outer_bags=1, random_state=0).fit(X, y)
+    effect = model.explain(X).missing.sum(axis=(1, 2))
+    assert np.corrcoef(effect, missing_count)[0, 1] > 0.8
+
+
 def test_missing_effects_with_reml_and_warning(longitudinal_data):
     X, y = longitudinal_data
     model = SSTGAM(missing_effects=True, temporal_penalty="reml", static_penalty="reml", outer_bags=1).fit(X, y)
