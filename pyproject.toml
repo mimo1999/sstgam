@@ -46,6 +46,7 @@ Issues = "https://github.com/mimo1999/sstgam/issues"
 
 [project.optional-dependencies]
 dev = ["pandas>=1.5", "pytest"]
+viz = ["plotly>=5.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

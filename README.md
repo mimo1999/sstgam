@@ -234,6 +234,58 @@ row = 0  # what each observed time of signal_a adds for the first row
 dict(zip(model.time_ids_, explanation.temporal[row, model.temporal_features_.index("signal_a")]))
 ```
 
+For interactive 3D value-by-time surfaces, install the optional Plotly
+dependency and save a standalone HTML page:
+
+```bash
+pip install "sstgam[viz]"
+```
+
+```python
+from sstgam.visualization import save_model_surfaces
+
+save_model_surfaces(model, "sstgam_surfaces.html", features=["signal_a"])
+```
+
+`save_model_surfaces` accepts fitted `SSTGAM` and `SSTGAMRegressor` models
+using either backend. For spline models, the value axis is sampled over the
+fitted value range and the time axis uses `model.time_ids_`. For tree models,
+the fitted value-bin by time table is rendered directly. Select several
+features to create a responsive grid of 3D plots:
+
+```python
+save_model_surfaces(
+    model,
+    "sstgam_surfaces.html",
+    features=model.temporal_features_,
+    n_value_points=50,
+    title="Fitted SSTGAM temporal surfaces",
+)
+```
+
+For programmatic use, `temporal_surface_figure(model, feature, ...)` returns a
+Plotly `Figure` for one feature instead of writing an HTML file. The plotted
+surface is on the model link scale and is time-centred for spline models,
+matching `temporal_surface(..., center_time=True)`.
+
+Plotly is optional and is imported only when `sstgam.visualization` is used.
+
+### Saving and loading fitted models
+
+There is no SSTGAM-specific serialization module. Fitted estimators follow
+the scikit-learn estimator interface and can be saved with Python's standard
+`pickle` or with `joblib`:
+
+```python
+import joblib
+
+joblib.dump(model, "sstgam_model.joblib")
+restored = joblib.load("sstgam_model.joblib")
+```
+
+Save and load models with the same Python environment and package version;
+serialized estimators are not a stable cross-version interchange format.
+
 ## Model
 
 <p align="center">
