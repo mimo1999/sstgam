@@ -47,9 +47,9 @@ f_k(value, time) = sum_p sum_q coefficient[k,p,q]
 ```
 
 `value_basis` and `time_basis` are drawn from one of two interchangeable
-families, selected by `basis`: fixed-bandwidth Gaussian radial basis
-functions (`"rbf"`, default) or a clamped, evenly knotted B-spline basis
-(`"bspline"`). Both are implemented in `bases.py` behind the same
+families, selected by `basis`: a clamped, evenly knotted B-spline basis
+(`"bspline"`, default) or fixed-bandwidth Gaussian radial basis functions
+(`"rbf"`). Both are implemented in `bases.py` behind the same
 `make_basis_params`/`basis_design` interface, so the rest of the fitting
 code is basis-agnostic. Second-difference penalties on adjacent coefficients
 keep the surface smooth along both the value and time axes regardless of

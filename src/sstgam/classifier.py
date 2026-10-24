@@ -54,7 +54,7 @@ class _SSTGAMBase(BaseEstimator):
         n_static_bases: int = 8,
         n_value_bins: int = 16,
         tree_depth: int = 3,
-        basis: str = "rbf",
+        basis: str = "bspline",
         value_transform: str = "quantile",
         temporal_penalty: float | str = "auto",
         static_penalty: float | str = "auto",
@@ -584,16 +584,15 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
         ``"spline"`` fits smooth tensor-product value-time surfaces.
         ``"tree"`` fits discrete value-bin by time-bin tables.
     n_value_bases, n_time_bases, n_static_bases : int
-        Number of RBF bases used by the spline method.
+        Number of spline bases used by the spline method.
     n_value_bins, tree_depth : int
         Value bin count and shallow-tree depth used by the tree method.
-    basis : {"rbf", "bspline"}, default="rbf"
+    basis : {"bspline", "rbf"}, default="bspline"
         Basis family used by the spline method's value-time surfaces.
-        ``"rbf"`` places fixed-bandwidth Gaussian bumps on evenly spaced
-        centers. ``"bspline"`` fits a clamped, evenly knotted B-spline basis
-        of the same size. Both use the same second-difference roughness
-        penalty, so smoothness is controlled the same way regardless of
-        basis. Ignored when ``method="tree"``.
+        ``"bspline"`` fits a clamped, evenly knotted cubic B-spline basis.
+        ``"rbf"`` selects fixed-bandwidth Gaussian bumps on evenly spaced
+        centers for backwards-compatible experiments. Both use the same
+        second-difference roughness penalty. Ignored when ``method="tree"``.
     value_transform : {"quantile", "zscore"}, default="quantile"
         Per-feature value normalization for the spline method, applied to
         temporal values and static covariates alike.
@@ -757,7 +756,7 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
         n_static_bases: int = 8,
         n_value_bins: int = 16,
         tree_depth: int = 3,
-        basis: str = "rbf",
+        basis: str = "bspline",
         value_transform: str = "quantile",
         temporal_penalty: float | str = "auto",
         static_penalty: float | str = "auto",

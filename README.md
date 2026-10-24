@@ -271,9 +271,10 @@ for the fitting details.
 - `method="spline"` (default) uses smooth tensor-product surfaces with
   roughness penalties. Use this when you want smooth effect plots; unevenly
   spaced time ids (e.g. days 0, 3, 7, 14) are placed at their actual
-  distances. Set `basis="rbf"` (default) for
-  fixed-bandwidth Gaussian bumps or `basis="bspline"` for a clamped B-spline
-  basis of the same size; both use the same roughness penalty.
+  distances. The default `basis="bspline"` uses a clamped B-spline basis.
+  Set `basis="rbf"` to use fixed-bandwidth Gaussian bumps for a
+  backwards-compatible experimental comparison; both use the same roughness
+  penalty.
 - `method="tree"` uses quantile value bins and shallow tree updates to learn a
   discrete value-time table. Use `value_time_table(feature)` to inspect it.
 

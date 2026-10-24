@@ -116,7 +116,7 @@ class SharedShapeTemporalGAMBoost:
         n_value_bases: int = 8,
         n_time_bases: int = 5,
         n_static_bases: int = 8,
-        basis: str = "rbf",
+        basis: str = "bspline",
         value_transform: str = "quantile",
         temporal_penalty: float | str = "auto",
         static_penalty: float | str = "auto",

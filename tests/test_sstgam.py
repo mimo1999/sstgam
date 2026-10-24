@@ -65,11 +65,16 @@ def test_bspline_basis_fits_and_predicts(longitudinal_data):
         SSTGAM(basis="unknown").fit(X, y)
 
 
+def test_bspline_is_default_and_rbf_remains_selectable():
+    assert SSTGAM().basis == "bspline"
+    assert SSTGAM(basis="rbf").basis == "rbf"
+
+
 def test_spline_bands_are_bayesian_and_shrink_with_more_data(longitudinal_data):
     X, y = longitudinal_data
 
     def band_width(n):
-        model = SSTGAM(method="spline", max_rounds=12, early_stopping_rounds=4, outer_bags=1, random_state=4
+        model = SSTGAM(method="spline", temporal_penalty=100.0, static_penalty=100.0, outer_bags=1, random_state=4
                        ).fit(X.iloc[:n], y[:n])
         lower, mean, upper = model.value_effect("signal", [0.0, 1.0], return_interval=True)
         assert np.all(lower <= mean + 1e-9) and np.all(mean <= upper + 1e-9)
