@@ -74,6 +74,8 @@ class _SSTGAMBase(BaseEstimator):
         max_leaves: int | None = None,
         min_gain: float = 0.0,
         bin_edges: str = "quantile",
+        context_channels: Iterable[str] = (),
+        context_order: str = "ascending",
         random_state: int = 42,
     ) -> None:
         self.method = method
@@ -102,6 +104,8 @@ class _SSTGAMBase(BaseEstimator):
         self.max_leaves = max_leaves
         self.min_gain = min_gain
         self.bin_edges = bin_edges
+        self.context_channels = context_channels
+        self.context_order = context_order
         self.random_state = random_state
 
     def _parse_columns(self, column_names: list[str]):
@@ -180,13 +184,13 @@ class _SSTGAMBase(BaseEstimator):
 
     def _build_tensors(self, matrix: np.ndarray):
         n_samples = matrix.shape[0]
-        n_features = len(self.temporal_features_)
+        n_features = len(self._base_features_)
         n_times = len(self.time_ids_)
         values = np.zeros((n_samples, n_features, n_times), dtype=np.float32)
         observed = np.zeros_like(values)
         time_positions = {time_id: index for index, time_id in enumerate(self.time_ids_)}
 
-        for feature_index, feature_name in enumerate(self.temporal_features_):
+        for feature_index, feature_name in enumerate(self._base_features_):
             for time_id, column_index in self._temporal_columns[feature_name].items():
                 column = matrix[:, column_index]
                 is_observed = np.isfinite(column)
@@ -204,9 +208,48 @@ class _SSTGAMBase(BaseEstimator):
             missingness_fraction = observed.mean(axis=2).astype(np.float32)
             static_values = np.concatenate([static_values, missingness_fraction], axis=1)
 
+        if self.context_channels:
+            derived_values, derived_observed = self._context_tensors(values, observed)
+            values = np.concatenate([values, derived_values], axis=1)
+            observed = np.concatenate([observed, derived_observed], axis=1)
         return values, observed, static_values
 
+    def _context_tensors(self, values: np.ndarray, observed: np.ndarray):
+        """History-relative channels, each a pseudo-feature with its own value-by-time surface.
+
+        Cells are visited in chronological order (``context_order``) and every channel at a cell uses only that
+        cell and strictly earlier ones, so nothing looks ahead. ``"change"``: at an observed cell with an earlier
+        observation, the value minus the previous observed value. ``"staleness"``: at every cell from the first
+        observation on, the time since the last observation (0 at an observed cell).
+        """
+        n_samples, n_features, n_times = values.shape
+        ids = np.asarray(self.time_ids_, dtype=np.float64)
+        order = np.arange(n_times) if self.context_order == "ascending" else np.arange(n_times)[::-1]
+        last_value = np.zeros((n_samples, n_features), dtype=np.float32)
+        last_time = np.zeros((n_samples, n_features))
+        has_previous = np.zeros((n_samples, n_features), dtype=bool)
+        change = np.zeros_like(values)
+        change_seen = np.zeros_like(values)
+        stale = np.zeros_like(values)
+        stale_seen = np.zeros_like(values)
+        for t in order:
+            seen = observed[:, :, t] > 0
+            usable = seen & has_previous
+            change[:, :, t] = np.where(usable, values[:, :, t] - last_value, 0.0)
+            change_seen[:, :, t] = usable
+            known = seen | has_previous
+            stale[:, :, t] = np.where(known & ~seen, np.abs(ids[t] - last_time), 0.0)
+            stale_seen[:, :, t] = known
+            last_value = np.where(seen, values[:, :, t], last_value)
+            last_time = np.where(seen, ids[t], last_time)
+            has_previous |= seen
+        channels = {"change": (change, change_seen), "staleness": (stale, stale_seen)}
+        chosen = [name for name in ("change", "staleness") if name in self.context_channels]
+        return (np.concatenate([channels[name][0] for name in chosen], axis=1),
+                np.concatenate([channels[name][1] for name in chosen], axis=1))
+
     def _fit(self, matrix: np.ndarray, names: list[str], target: np.ndarray, sample_weight) -> None:
+        self._validate_hyperparameters()
         if target.shape[0] != matrix.shape[0]:
             raise ValueError("X and y must contain the same number of rows.")
         if sample_weight is not None:
@@ -236,9 +279,12 @@ class _SSTGAMBase(BaseEstimator):
             time_id for feature_name in self.temporal_features_
             for time_id in temporal_columns[feature_name]
         })
+        self._base_features_ = list(self.temporal_features_)
+        self.temporal_features_ = self._base_features_ + [
+            f"{name} [{channel}]" for channel in ("change", "staleness") if channel in self.context_channels
+            for name in self._base_features_]
 
         values, observed, static_values = self._build_tensors(matrix)
-        self._validate_hyperparameters()
         if self.missing_effects and self.include_missingness_indicators:
             warnings.warn("missing_effects and include_missingness_indicators both encode how often features are "
                           "measured; missing_effects alone is usually enough.", stacklevel=3)
@@ -344,6 +390,11 @@ class _SSTGAMBase(BaseEstimator):
             raise ValueError("min_leaf_hessian must be non-negative.")
         if self.min_gain < 0:
             raise ValueError("min_gain must be non-negative.")
+        unknown = set(self.context_channels) - {"change", "staleness"}
+        if unknown:
+            raise ValueError(f"context_channels must be drawn from 'change' and 'staleness', got {sorted(unknown)}")
+        if self.context_order not in {"ascending", "descending"}:
+            raise ValueError(f"context_order must be 'ascending' or 'descending', got {self.context_order!r}")
         if self.bin_edges not in {"quantile", "distinct"}:
             raise ValueError(f"bin_edges must be 'quantile' or 'distinct', got {self.bin_edges!r}")
         if self.max_leaves is not None and self.max_leaves < 2:
@@ -626,6 +677,14 @@ class SSTGAM(ClassifierMixin, _SSTGAMBase):
     min_leaf_hessian, max_leaves : optional
         Tree method: the smallest total curvature a leaf may hold, and the
         largest number of leaves per tree update.
+    context_channels : iterable of {"change", "staleness"}, default=()
+        History-relative channels added as extra temporal terms, each with its own value-by-time surface and
+        named ``"<feature> [change]"`` / ``"<feature> [staleness]"``. ``"change"`` is the value minus the
+        previous observed value; ``"staleness"`` is the time since the last observation (0 when observed). A cell
+        uses only itself and strictly earlier cells.
+    context_order : {"ascending", "descending"}, default="ascending"
+        Whether larger time ids are later (``"ascending"``) or earlier (``"descending"``, e.g. lag-indexed
+        columns where 0 is the most recent), which fixes what "previous" means for the channels.
     min_gain : float, default=0.0
         Tree method: skip a table update (leave that term alone this round)
         unless its Newton gain, twice the second-order loss decrease, reaches
@@ -718,6 +777,8 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
         max_leaves: int | None = None,
         min_gain: float = 0.0,
         bin_edges: str = "quantile",
+        context_channels: Iterable[str] = (),
+        context_order: str = "ascending",
         random_state: int = 42,
     ) -> None:
         super().__init__(
@@ -730,7 +791,8 @@ class SSTGAMRegressor(RegressorMixin, _SSTGAMBase):
             static_columns=static_columns, interactions=interactions, n_pair_bases=n_pair_bases,
             penalty_sharing=penalty_sharing, missing_effects=missing_effects, bag_validation=bag_validation,
             min_leaf_hessian=min_leaf_hessian,
-            max_leaves=max_leaves, min_gain=min_gain, bin_edges=bin_edges, random_state=random_state,
+            max_leaves=max_leaves, min_gain=min_gain, bin_edges=bin_edges, context_channels=context_channels,
+            context_order=context_order, random_state=random_state,
         )
         self.family = family
 

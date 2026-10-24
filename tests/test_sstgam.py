@@ -526,3 +526,69 @@ def test_tree_min_gain_and_distinct_edges(longitudinal_data):
     for bad in ({"min_gain": -1.0}, {"bin_edges": "uniform"}):
         with pytest.raises(ValueError):
             fit(**bad)
+
+
+def history_data(n=1500, times=6, seed=0):
+    """Risk rises with the change since the previous measurement, not with the level."""
+    rng = np.random.RandomState(seed)
+    level = rng.normal(size=(n, 1)) + 0.4 * rng.normal(size=(n, times))
+    seen = rng.rand(n, times) < 0.7
+    previous = np.full(n, np.nan)
+    change = np.zeros(n)
+    for t in range(times):
+        now = np.where(seen[:, t], level[:, t], np.nan)
+        ok = ~np.isnan(now) & ~np.isnan(previous)
+        change = np.where(ok, change + (now - previous), change)
+        previous = np.where(~np.isnan(now), now, previous)
+    y = (rng.rand(n) < 1 / (1 + np.exp(-(1.8 * change - 1.5)))).astype(int)
+    columns = {f"lab_{t}": np.where(seen[:, t], level[:, t], np.nan) for t in range(times)}
+    return pd.DataFrame(columns), y
+
+
+def test_context_channels_have_no_look_ahead_and_follow_the_order():
+    X, _ = history_data(n=40, times=5)
+    model = SSTGAM(context_channels=("change", "staleness"), outer_bags=1, max_rounds=2)
+    model.temporal_features_ = ["lab"]
+    model._base_features_ = ["lab"]
+    model.time_ids_ = [0, 1, 2, 3, 4]
+    values = np.nan_to_num(X.to_numpy())[:, None, :].astype(np.float32)
+    observed = X.notna().to_numpy()[:, None, :].astype(np.float32)
+    first = model._context_tensors(values, observed)
+    values2, observed2 = values.copy(), observed.copy()
+    values2[:, :, 4], observed2[:, :, 4] = 7.0, 1.0  # change the LAST cell only
+    second = model._context_tensors(values2, observed2)
+    for a, b in zip(first, second):  # n x 2 channels x 5 times: cells 0..3 must be untouched
+        np.testing.assert_array_equal(a[:, :, :4], b[:, :, :4])
+    # descending order reverses what "previous" means
+    model.context_order = "descending"
+    reverse = model._context_tensors(values[:, :, ::-1].copy(), observed[:, :, ::-1].copy())
+    model.context_order = "ascending"
+    np.testing.assert_array_equal(reverse[0][:, :, ::-1], first[0])
+
+
+def test_change_channel_recovers_a_change_driven_outcome():
+    X, y = history_data()
+    from sklearn.metrics import roc_auc_score
+    train, test = slice(0, 1000), slice(1000, None)
+
+    def auc(**kw):
+        model = SSTGAM(outer_bags=1, random_state=0, **kw).fit(X.iloc[train], y[train])
+        return roc_auc_score(y[test], model.predict_proba(X.iloc[test])[:, 1])
+
+    base, with_change = auc(), auc(context_channels=("change",))
+    assert with_change > base + 0.1, (base, with_change)
+    model = SSTGAM(context_channels=("change", "staleness"), outer_bags=1, random_state=0).fit(X, y)
+    assert model.temporal_features_ == ["lab", "lab [change]", "lab [staleness]"]
+    explanation = model.explain(X)
+    assert explanation.temporal.shape == (len(X), 3, 6)
+    np.testing.assert_allclose(model.decision_function(X), explanation.intercept + explanation.temporal.sum(axis=(1, 2))
+                               + explanation.static.sum(axis=1) + explanation.pairs.sum(axis=1)
+                               + explanation.missing.sum(axis=(1, 2)), atol=1e-8)
+
+
+def test_invalid_context_settings_are_rejected():
+    X, y = history_data(n=200)
+    with pytest.raises(ValueError, match="context_channels"):
+        SSTGAM(context_channels=("trend",)).fit(X, y)
+    with pytest.raises(ValueError, match="context_order"):
+        SSTGAM(context_channels=("change",), context_order="sideways").fit(X, y)
