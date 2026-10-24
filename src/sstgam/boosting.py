@@ -647,11 +647,13 @@ class SharedShapeTemporalGAMBoost:
             self._bagged_pair_coefficients = []
             self._bagged_missing_coefficients = []
             self.n_iter_ = []
+            betas = []
             for fit_indices in bootstrap_bags(np.arange(n_samples), self.outer_bags, rng):
                 beta, n_iter = self._penalized_newton(
                     design[fit_indices], target[fit_indices], sample_weight[fit_indices], penalty,
                     initial=initial,
                 )
+                betas.append(beta)
                 coefficients: dict[str, list[np.ndarray]] = {"temporal": [], "static": [], "pair": [], "missing": []}
                 start = 1
                 for term in terms:
@@ -668,7 +670,9 @@ class SharedShapeTemporalGAMBoost:
                     if coefficients["missing"] else None)
                 self.n_iter_.append(n_iter)
 
-            # Posterior covariance (H + S)^-1 at the last fit (exact for one bag), mapped to uncentred coefficients.
+            # Posterior covariance (H + S)^-1 on the full data at the bag-averaged coefficients (the model the surfaces
+            # report), mapped to uncentred coefficients. It does not include the variation between bags.
+            beta = np.mean(betas, axis=0)
             eta = np.concatenate([design[rows].astype(np.float64) @ beta for rows in _row_chunks(design.shape[0])])
             hessian = self._hessian(design, sample_weight, eta)
             covariance = np.linalg.inv(hessian + penalty)

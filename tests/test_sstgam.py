@@ -79,6 +79,25 @@ def test_spline_bands_are_bayesian_and_shrink_with_more_data(longitudinal_data):
     assert 0.0 < width_large < width_small  # a single bag still gets a non-degenerate band
 
 
+def test_bagged_band_is_centred_on_the_bag_average(longitudinal_data):
+    X, y = longitudinal_data
+    model = SSTGAM(method="spline", temporal_penalty=100.0, static_penalty=100.0, outer_bags=3, random_state=4).fit(X, y)
+    lower, mean, upper = model.value_effect("signal", [0.0, 1.0], return_interval=True)
+    np.testing.assert_allclose(mean, model.value_effect("signal", [0.0, 1.0]))
+    assert np.all(lower < mean) and np.all(mean < upper)
+
+
+def test_tree_pair_ranking_excludes_validation_rows(monkeypatch):
+    from sstgam import tree_boost
+
+    seen = []
+    original = tree_boost.fast_gain
+    monkeypatch.setattr(tree_boost, "fast_gain", lambda g, h, cells, *rest: (seen.append(len(g)), original(g, h, cells, *rest))[1])
+    X, y = interaction_data(1000, 0)
+    SSTGAM(method="tree", outer_bags=1, interactions=2, max_rounds=5, val_fraction=0.2).fit(X, y)
+    assert seen and set(seen) == {800}
+
+
 def test_centred_surface_has_zero_training_mean_at_each_time(longitudinal_data):
     X, y = longitudinal_data
     model = SSTGAM(method="spline", outer_bags=1, random_state=4).fit(X, y)

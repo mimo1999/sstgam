@@ -394,8 +394,10 @@ class SharedShapeTemporalGAMTreeBoost:
             score = self._score(values, observed, static_values)
             pair_data = [self._pair_bins(values, observed, static_values, pair) for pair in pairs]
             if n_interactions < len(pairs):
-                gradient, hessian = self._grad_hess(score, target, weights)
-                gains = [fast_gain(gradient, hessian, *data) for data in pair_data]
+                # rank on the rows the bags fit from, so the validation rows stay unseen by the pair choice
+                gradient, hessian = self._grad_hess(score[train_indices], target[train_indices], weights[train_indices])
+                gains = [fast_gain(gradient, hessian, cells[train_indices], mask[train_indices], n_u, n_w)
+                         for cells, mask, n_u, n_w in pair_data]
                 keep = np.argsort(gains, kind="stable")[::-1][:n_interactions]
                 pairs, pair_data = [pairs[i] for i in keep], [pair_data[i] for i in keep]
             self._pairs, self._pair_shapes = list(pairs), [(n_u, n_w) for _, _, n_u, n_w in pair_data]
